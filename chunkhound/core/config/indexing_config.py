@@ -70,6 +70,14 @@ class IndexingConfig(BaseModel):
         ),
     )
 
+    chunker: Literal["cast", "prose"] = Field(
+        default="cast",
+        description=(
+            "Chunking strategy: cast (code AST) or prose (headings/paragraphs "
+            "for memory documents)"
+        ),
+    )
+
     # File parsing safety
     per_file_timeout_seconds: float = Field(
         default=3.0,

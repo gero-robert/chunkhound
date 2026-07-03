@@ -708,6 +708,7 @@ class IndexingCoordinator(BaseService):
         detect_embedded_sql = getattr(
             getattr(self.config, "indexing", None), "detect_embedded_sql", True
         )
+        chunker = getattr(getattr(self.config, "indexing", None), "chunker", "cast")
 
         # Default behavior:
         # - If timeouts are enabled and no explicit max_concurrent given,
@@ -739,6 +740,7 @@ class IndexingCoordinator(BaseService):
                 # Cap concurrent timeout children to avoid resource exhaustion
                 "max_concurrent_timeouts": min(max(1, num_workers) * 2, 32),
                 "detect_embedded_sql": detect_embedded_sql,
+                "chunker": chunker,
             }
 
             # Normalize to the batch-processor input format
@@ -808,6 +810,7 @@ class IndexingCoordinator(BaseService):
                 # Cap concurrent timeout children to avoid resource exhaustion
                 "max_concurrent_timeouts": min(num_workers * 2, 32),
                 "detect_embedded_sql": detect_embedded_sql,
+                "chunker": chunker,
             }
             futures = [
                 loop.run_in_executor(executor, process_file_batch, batch, config_dict)

@@ -55,6 +55,7 @@ def _parse_file_worker(
     language_value: str,
     conn: Connection,
     detect_embedded_sql: bool = True,
+    chunker: str = "cast",
 ) -> None:
     """Child-process worker to parse a single file and send results via pipe.
 
@@ -72,11 +73,19 @@ def _parse_file_worker(
             Language as _Language,
         )
         from chunkhound.parsers.parser_factory import (
-            create_parser_for_language as _create,
+            create_parser_for_file as _create_for_file,
+            create_parser_for_language as _create_for_language,
         )
 
         language = _Language.from_string(language_value)
-        parser = _create(language, detect_embedded_sql=detect_embedded_sql)
+        if chunker == "prose":
+            parser = _create_for_file(
+                _Path(file_path_str),
+                detect_embedded_sql=detect_embedded_sql,
+                chunker=chunker,
+            )
+        else:
+            parser = _create_for_language(language, detect_embedded_sql=detect_embedded_sql)
         if not parser:
             conn.send(("error", f"No parser available for {language}"))
             return
@@ -101,6 +110,7 @@ def _parse_file_with_timeout(
     language: Language,
     timeout_s: float,
     detect_embedded_sql: bool = True,
+    chunker: str = "cast",
 ) -> tuple[str, list[dict] | str | None]:
     """Parse a file in a child process with a wall-clock timeout.
 
@@ -115,7 +125,7 @@ def _parse_file_with_timeout(
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     p = ctx.Process(
         target=_parse_file_worker,
-        args=(str(file_path), language.value, child_conn, detect_embedded_sql),
+        args=(str(file_path), language.value, child_conn, detect_embedded_sql, chunker),
         daemon=True,
     )
     _dbg_log(f"TIMEOUT-SPAWN start: {file_path}")
@@ -303,14 +313,15 @@ def process_file_batch(
             # Parse file and generate chunks (with optional per-file timeout)
             if timeout_s > 0 and ((file_stat.st_size / 1024) >= timeout_min_kb):
                 detect_sql = bool(config_dict.get("detect_embedded_sql", True))
+                chunker = str(config_dict.get("chunker", "cast"))
                 if _timeout_semaphore is not None:
                     with _timeout_semaphore:
                         status, payload = _parse_file_with_timeout(
-                            file_path, language, timeout_s, detect_sql
+                            file_path, language, timeout_s, detect_sql, chunker
                         )
                 else:
                     status, payload = _parse_file_with_timeout(
-                        file_path, language, timeout_s, detect_sql
+                        file_path, language, timeout_s, detect_sql, chunker
                     )
                 if status == "timeout":
                     # Defer user notification to final summary; avoid live console noise
@@ -351,12 +362,28 @@ def process_file_batch(
                     chunks_data = payload if isinstance(payload, list) else []
             else:
                 # No timeout path (original behavior)
-                parser = create_parser_for_language(
-                    language,
-                    detect_embedded_sql=bool(
-                        config_dict.get("detect_embedded_sql", True)
-                    ),
-                )
+                chunker_mode = str(config_dict.get("chunker", "cast"))
+                if chunker_mode == "prose":
+                    from chunkhound.parsers.parser_factory import create_parser_for_file
+
+                    parser = create_parser_for_file(
+                        file_path,
+                        detect_embedded_sql=bool(
+                            config_dict.get("detect_embedded_sql", True)
+                        ),
+                        chunker=chunker_mode,
+                    )
+                else:
+                    from chunkhound.parsers.parser_factory import (
+                        create_parser_for_language,
+                    )
+
+                    parser = create_parser_for_language(
+                        language,
+                        detect_embedded_sql=bool(
+                            config_dict.get("detect_embedded_sql", True)
+                        ),
+                    )
                 if not parser:
                     results.append(
                         ParsedFileResult(

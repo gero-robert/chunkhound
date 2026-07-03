@@ -562,6 +562,7 @@ class ParserFactory:
         file_path: Path,
         cast_config: CASTConfig | None = None,
         detect_embedded_sql: bool = True,
+        chunker: str | None = None,
     ) -> LanguageParser:
         """Create a parser appropriate for the given file.
 
@@ -569,6 +570,7 @@ class ParserFactory:
             file_path: Path to the file to parse
             cast_config: Optional cAST configuration
             detect_embedded_sql: Whether to detect embedded SQL strings
+            chunker: Optional chunker override (cast or prose)
 
         Returns:
             LanguageParser instance appropriate for the file
@@ -577,6 +579,13 @@ class ParserFactory:
             SetupError: If the required tree-sitter module is not available
             ValueError: If the file type is not supported
         """
+        # MEMORY: prose chunker for natural-language memory documents
+        if chunker == "prose":
+            from chunkhound.parsers.prose import ProseParser, is_prose_file
+
+            if is_prose_file(file_path):
+                return ProseParser(cast_config)
+
         language = self.detect_language(file_path)
         return self.create_parser(language, cast_config, detect_embedded_sql)
 
@@ -738,6 +747,7 @@ def create_parser_for_file(
     file_path: Path,
     cast_config: CASTConfig | None = None,
     detect_embedded_sql: bool = True,
+    chunker: str | None = None,
 ) -> LanguageParser:
     """Convenience function to create a parser for a file.
 
@@ -745,12 +755,15 @@ def create_parser_for_file(
         file_path: Path to the file to parse
         cast_config: Optional cAST configuration
         detect_embedded_sql: Whether to detect embedded SQL strings
+        chunker: Optional chunker override (cast or prose)
 
     Returns:
         LanguageParser instance appropriate for the file
     """
     factory = get_parser_factory(cast_config)
-    return factory.create_parser_for_file(file_path, cast_config, detect_embedded_sql)
+    return factory.create_parser_for_file(
+        file_path, cast_config, detect_embedded_sql, chunker=chunker
+    )
 
 
 def create_parser_for_language(
