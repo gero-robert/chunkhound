@@ -118,11 +118,18 @@ async def async_main() -> None:
     # Setup logging for non-MCP commands (MCP already handled above)
     setup_logging(getattr(args, "verbose", False))
 
-    if args.command == "memory" and getattr(args, "memory_command", None) == "init":
-        from .commands.memory_init import memory_init_command
+    if args.command == "memory":
+        memory_command = getattr(args, "memory_command", None)
+        if memory_command == "init":
+            from .commands.memory_init import memory_init_command
 
-        await memory_init_command(args)
-        return
+            await memory_init_command(args)
+            return
+        if memory_command == "mcp":
+            from .commands.memory_mcp import memory_mcp_command
+
+            await memory_mcp_command(args)
+            return
 
     # Validate args and create config
     # Special-case: index subtools (--simulate, --check-ignores) skip embeddings
