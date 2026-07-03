@@ -78,6 +78,7 @@ def create_parser() -> argparse.ArgumentParser:
     from .parsers.code_mapper_parser import add_map_subparser
     from .parsers.daemon_parser import add_daemon_subparser
     from .parsers.mcp_parser import add_mcp_subparser
+    from .parsers.memory_parser import add_memory_subparser
     from .parsers.quickresearch_parser import add_quickresearch_subparser
     from .parsers.research_parser import add_research_subparser
     from .parsers.run_parser import add_run_subparser
@@ -100,6 +101,7 @@ def create_parser() -> argparse.ArgumentParser:
     # Internal commands (hidden from help)
     add_quickresearch_subparser(subparsers)
     add_daemon_subparser(subparsers)
+    add_memory_subparser(subparsers)
 
     return parser
 
@@ -115,6 +117,12 @@ async def async_main() -> None:
 
     # Setup logging for non-MCP commands (MCP already handled above)
     setup_logging(getattr(args, "verbose", False))
+
+    if args.command == "memory" and getattr(args, "memory_command", None) == "init":
+        from .commands.memory_init import memory_init_command
+
+        await memory_init_command(args)
+        return
 
     # Validate args and create config
     # Special-case: index subtools (--simulate, --check-ignores) skip embeddings
