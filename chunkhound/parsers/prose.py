@@ -20,6 +20,7 @@ from chunkhound.core.types.common import (
     LineNumber,
 )
 from chunkhound.parsers.chunk_splitter import CASTConfig, ChunkSplitter
+from chunkhound.parsers.frontmatter import FrontmatterExtractor
 from chunkhound.parsers.universal_engine import UniversalChunk, UniversalConcept
 from chunkhound.utils.normalization import normalize_content
 
@@ -66,6 +67,7 @@ class ProseParser:
     def __init__(self, cast_config: CASTConfig | None = None) -> None:
         self.cast_config = cast_config or CASTConfig()
         self.chunk_splitter = ChunkSplitter(self.cast_config)
+        self.frontmatter_extractor = FrontmatterExtractor()
 
     @property
     def language(self) -> Language:
@@ -101,9 +103,10 @@ class ProseParser:
         if not content.strip():
             return []
 
-        body, line_offset = _strip_frontmatter_stub(content)
+        body, frontmatter = self.frontmatter_extractor.extract(content)
+        line_offset = _frontmatter_line_offset(content)
         segments = _segment_prose(body, start_line=1 + line_offset)
-        universal_chunks = _segments_to_universal(segments)
+        universal_chunks = _segments_to_universal(segments, frontmatter)
         validated: list[UniversalChunk] = []
         for chunk in universal_chunks:
             validated.extend(self.chunk_splitter.validate_and_split(chunk))
@@ -116,28 +119,20 @@ class ProseParser:
         )
 
 
-def _strip_frontmatter_stub(content: str) -> tuple[str, int]:
-    """Remove YAML frontmatter block; metadata extraction added in Phase 2."""
+def _frontmatter_line_offset(content: str) -> int:
+    """Return number of frontmatter lines removed from the source document."""
     if not content.startswith("---"):
-        return content, 0
+        return 0
 
     lines = content.split("\n")
     if len(lines) < 2:
-        return content, 0
+        return 0
 
-    end_idx: int | None = None
     for idx in range(1, len(lines)):
         if lines[idx].strip() == "---":
-            end_idx = idx
-            break
+            return idx + 1
 
-    if end_idx is None:
-        return content, 0
-
-    body = "\n".join(lines[end_idx + 1 :])
-    if body.startswith("\n"):
-        body = body[1:]
-    return body, end_idx + 1
+    return 0
 
 
 def _segment_prose(body: str, *, start_line: int) -> list[_ProseSegment]:
@@ -329,13 +324,17 @@ def _symbol_from_content(content: str) -> str:
     return cleaned[:60]
 
 
-def _segments_to_universal(segments: list[_ProseSegment]) -> list[UniversalChunk]:
+def _segments_to_universal(
+    segments: list[_ProseSegment],
+    frontmatter: dict[str, object],
+) -> list[UniversalChunk]:
     universal: list[UniversalChunk] = []
     for segment in segments:
         metadata: dict[str, object] = {
             "chunk_type_hint": segment.chunk_type.value,
             "parser": "prose",
         }
+        metadata.update(frontmatter)
         if segment.parent_header:
             metadata["parent_header"] = segment.parent_header
         universal.append(
