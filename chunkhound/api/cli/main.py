@@ -130,6 +130,11 @@ async def async_main() -> None:
 
             await memory_mcp_command(args)
             return
+        if memory_command == "serve":
+            from .commands.memory_serve import memory_serve_command
+
+            await memory_serve_command(args)
+            return
 
     # Validate args and create config
     # Special-case: index subtools (--simulate, --check-ignores) skip embeddings
