@@ -39,6 +39,9 @@ Your AI assistant searches code but doesn't understand it. ChunkHound researches
 **Visit [chunkhound.ai](https://chunkhound.ai) for documentation:**
 - [Configuration Guide](https://chunkhound.ai/docs/configuration/)
 
+**Agent Memory MCP (this branch):** multi-machine shared long-term memory for coding agents.
+- [Memory setup & client connections](docs/memory-setup.md) — init, `memory serve`, Claude Code / Cowork / Grok Build / Cursor / VS Code
+
 ## Requirements
 
 - Python 3.10+
