@@ -32,15 +32,19 @@ async def test_memory_init_creates_layout(tmp_path: Path, monkeypatch: pytest.Mo
     assert (memory_dir / "preferences" / "user_preference.md").is_file()
     assert (memory_dir / "skills" / "skill.md").is_file()
     assert (memory_dir / "lessons" / "lesson.md").is_file()
+    assert (memory_dir / "decisions" / "decision.md").is_file()
+    assert (memory_dir / "archive").is_dir()
 
     protocol = (memory_dir / "MEMORY_PROTOCOL.md").read_text(encoding="utf-8")
     assert "memory_research" in protocol
     assert "memory_semantic_search" in protocol
+    assert "memory_store" in protocol
     for line in _PROTOCOL_SNIPPET.split("\n"):
         assert line in protocol
 
     config = json.loads((memory_dir / ".chunkhound.json").read_text(encoding="utf-8"))
     assert config["indexing"]["chunker"] == "prose"
+    assert "archive/**" in config["indexing"]["exclude"]
 
     preference_path = memory_dir / "preferences" / "user_preference.md"
     preference_path.write_text("custom preference content", encoding="utf-8")

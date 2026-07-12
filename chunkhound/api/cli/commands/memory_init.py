@@ -14,6 +14,7 @@ from chunkhound.services.memory.paths import (
     resolve_memory_dir,
 )
 
+
 def _template_dir() -> Path:
     try:
         from importlib.resources import files
@@ -21,16 +22,17 @@ def _template_dir() -> Path:
         return Path(str(files("chunkhound.services.memory").joinpath("templates")))
     except Exception:
         return Path(__file__).resolve().parents[3] / "services" / "memory" / "templates"
+
+
 _PROTOCOL_SNIPPET = (
     "ALWAYS start by calling memory_research with a query derived from the current "
     "user request plus any known user preferences.\n"
-    "If you discover new information about how the user wants you to behave, or "
-    "what worked/didn't work, append a new entry using the exact Markdown + YAML "
-    "frontmatter format shown in the templates.\n"
-    "You have two memory tools: prefer memory_research first (it gives summarized "
-    "insight); use memory_semantic_search only when you need raw entries.\n"
-    "Document which tool gave better results in your next learning entry so we can "
-    "evolve the system."
+    "After important decisions, patterns, failures, or durable prefs, call "
+    "memory_store so other machines/sessions share the knowledge.\n"
+    "Prefer memory_research first (summarized insight); use memory_semantic_search "
+    "only when you need raw entries.\n"
+    "Use memory_archive for obsolete entries that mislead recall.\n"
+    "Store pointers and trade-offs, not large source dumps."
 )
 
 
@@ -42,14 +44,14 @@ def _memory_config(memory_dir: Path) -> dict[str, object]:
             "chunker": "prose",
             "include": ["*.md", "*.txt", "*.html"],
             "index_unknown_files": True,
-            "exclude": [".chunkhound/**"],
+            "exclude": [".chunkhound/**", "archive/**"],
         },
     }
 
 
 def _copy_templates(memory_dir: Path) -> None:
     template_dir = _template_dir()
-    for subdir in ("preferences", "skills", "lessons"):
+    for subdir in ("preferences", "skills", "lessons", "decisions", "archive"):
         (memory_dir / subdir).mkdir(parents=True, exist_ok=True)
 
     seed_files = (
@@ -57,16 +59,20 @@ def _copy_templates(memory_dir: Path) -> None:
         ("user_preference.md", memory_dir / "preferences" / "user_preference.md"),
         ("skill.md", memory_dir / "skills" / "skill.md"),
         ("lesson.md", memory_dir / "lessons" / "lesson.md"),
+        ("decision.md", memory_dir / "decisions" / "decision.md"),
     )
     for filename, destination in seed_files:
         if not destination.exists():
-            shutil.copy2(template_dir / filename, destination)
+            src = template_dir / filename
+            if src.exists():
+                shutil.copy2(src, destination)
 
 
 def _print_setup_instructions(memory_dir: Path) -> None:
     memory_dir_str = str(memory_dir).replace("\\", "/")
     print(f"Memory directory ready: {memory_dir}")
-    print("\nConfigure embeddings and LLM in .chunkhound.json, then attach MCP:")
+    print("\nConfigure embeddings and LLM in .chunkhound.json, then choose a mode:\n")
+    print("1) Local stdio (single machine):")
     print(
         json.dumps(
             {
@@ -81,6 +87,12 @@ def _print_setup_instructions(memory_dir: Path) -> None:
             indent=2,
         )
     )
+    print("\n2) LAN shared server (recommended multi-computer):")
+    print(
+        f"  chunkhound memory serve --dir {memory_dir_str} "
+        "--host 0.0.0.0 --port 8765 --token <secret>"
+    )
+    print("  Clients use the printed URL + Authorization Bearer header.")
     print("\nAgent protocol (also in MEMORY_PROTOCOL.md):")
     print(_PROTOCOL_SNIPPET)
 
@@ -97,6 +109,20 @@ async def memory_init_command(args: argparse.Namespace) -> None:
             json.dumps(_memory_config(memory_dir), indent=2) + "\n",
             encoding="utf-8",
         )
+    else:
+        # Ensure archive/** is excluded if config already exists
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+            indexing = existing.setdefault("indexing", {})
+            exclude = list(indexing.get("exclude") or [])
+            if "archive/**" not in exclude:
+                exclude.append("archive/**")
+                indexing["exclude"] = exclude
+                config_path.write_text(
+                    json.dumps(existing, indent=2) + "\n", encoding="utf-8"
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     _copy_templates(memory_dir)
 
