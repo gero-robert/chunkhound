@@ -3,7 +3,9 @@
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+. (Join-Path $ScriptDir "_lib.ps1")
+
+$RepoRoot = Resolve-ChunkHoundRepoRoot -ScriptDir $ScriptDir
 
 function Prompt-Value([string]$Message, [string]$Default = "") {
     if ($Default) {
@@ -40,6 +42,9 @@ Write-Host ""
 Write-Host "-> Initializing memory directory..."
 Set-Location $RepoRoot
 uv run chunkhound memory init --dir $MemoryDir
+if ($LASTEXITCODE -ne 0) {
+    throw "memory init failed (exit $LASTEXITCODE)"
+}
 
 $Config = Join-Path $MemoryDir ".chunkhound.json"
 if (-not (Test-Path $Config)) {
@@ -74,14 +79,8 @@ if ($provider) {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
     }
     if ($apiKey) {
-        $data = Get-Content $Config -Raw | ConvertFrom-Json
-        $data | Add-Member -NotePropertyName embedding -NotePropertyValue ([pscustomobject]@{
-            provider = $provider
-            api_key  = $apiKey
-            model    = $model
-        }) -Force
-        $data | ConvertTo-Json -Depth 10 | Set-Content -Path $Config -Encoding utf8
-        Write-Host "Updated embedding provider=$provider model=$model in $Config"
+        # Python merge avoids ConvertTo-Json BOM / array mangling; key via env not argv
+        Merge-EmbeddingConfig -ConfigPath $Config -Provider $provider -ApiKey $apiKey -Model $model
     } else {
         Write-Host "No API key entered - leaving embedding config unchanged."
     }
@@ -91,17 +90,15 @@ if ($provider) {
 }
 
 Write-Host ""
+$dbPath = Join-Path $MemoryDir ".chunkhound\db"
 if (Prompt-YesNo "Re-index memory directory with embeddings now?" "y") {
     Write-Host "-> Indexing (may take a minute)..."
-    $dbPath = Join-Path $MemoryDir ".chunkhound\db"
-    try {
-        uv run chunkhound index $MemoryDir --config $Config --db $dbPath
-    } catch {
-        Write-Host "Index failed. Fix embeddings/config and run:"
+    uv run chunkhound index $MemoryDir --config $Config --db $dbPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Index failed (exit $LASTEXITCODE). Fix embeddings/config and run:"
         Write-Host "  uv run chunkhound index `"$MemoryDir`" --config `"$Config`" --db `"$dbPath`""
     }
 } else {
-    $dbPath = Join-Path $MemoryDir ".chunkhound\db"
     Write-Host "MANUAL later:"
     Write-Host "  uv run chunkhound index `"$MemoryDir`" --config `"$Config`" --db `"$dbPath`""
 }
@@ -110,15 +107,54 @@ Write-Host ""
 Write-Host "LAN serve settings"
 $HostName = Prompt-Value "Bind host (0.0.0.0 = all interfaces)" "0.0.0.0"
 $Port = Prompt-Value "Port" "8765"
+if (-not (Test-MemoryPort -Port $Port)) {
+    throw "Invalid port '$Port' (need 1-65535)"
+}
 
-if ($env:CHUNKHOUND_MEMORY_TOKEN) {
+$envFile = Join-Path $MemoryDir "memory-serve.env"
+$existingToken = ""
+if (Test-Path $envFile) {
+    $existing = Read-MemoryEnvFile -Path $envFile
+    if ($existing.ContainsKey("CHUNKHOUND_MEMORY_TOKEN")) {
+        $existingToken = $existing["CHUNKHOUND_MEMORY_TOKEN"]
+    }
+}
+if (-not $existingToken -and $env:CHUNKHOUND_MEMORY_TOKEN) {
+    $existingToken = $env:CHUNKHOUND_MEMORY_TOKEN
+}
+
+if ($existingToken) {
+    Write-Host "Found existing token in env file or environment."
+    if (Prompt-YesNo "Reuse existing token? (n = generate/rotate - breaks existing clients)" "y") {
+        $Token = $existingToken
+        Write-Host "Reusing existing token."
+    } else {
+        Write-Host "WARNING: Rotating the token invalidates every harness config using the old one."
+        if (Prompt-YesNo "Generate a new random token?" "y") {
+            $bytes = New-Object byte[] 32
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            $Token = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+            Write-Host "Generated token (store safely; shown once here):"
+            Write-Host "  $Token"
+        } else {
+            $secureTok = Read-Host "Enter new token" -AsSecureString
+            $BSTR2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureTok)
+            try {
+                $Token = [Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR2)
+            } finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR2)
+            }
+        }
+    }
+} elseif ($env:CHUNKHOUND_MEMORY_TOKEN) {
     $Token = $env:CHUNKHOUND_MEMORY_TOKEN
-    Write-Host "Using existing CHUNKHOUND_MEMORY_TOKEN from environment."
+    Write-Host "Using CHUNKHOUND_MEMORY_TOKEN from environment."
 } elseif (Prompt-YesNo "Generate a random API token?" "y") {
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $Token = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
-    Write-Host "Generated token (store safely): $Token"
+    Write-Host "Generated token (store safely; shown once here):"
+    Write-Host "  $Token"
 } else {
     $secureTok = Read-Host "Enter token" -AsSecureString
     $BSTR2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureTok)
@@ -129,22 +165,21 @@ if ($env:CHUNKHOUND_MEMORY_TOKEN) {
     }
 }
 
+if (-not $Token) {
+    throw "Empty token not allowed."
+}
+
 $PublicHost = Prompt-Value "Hostname/IP other machines should use (for printed configs)" "127.0.0.1"
 
-$envFile = Join-Path $MemoryDir "memory-serve.env"
-@"
-# Generated by docs/memory/setup.ps1 - used by serve.ps1 / serve.sh
-CHUNKHOUND_MEMORY_DIR=$MemoryDir
-CHUNKHOUND_MEMORY_TOKEN=$Token
-CHUNKHOUND_MEMORY_HOST=$HostName
-CHUNKHOUND_MEMORY_PORT=$Port
-CHUNKHOUND_MEMORY_PUBLIC_HOST=$PublicHost
-"@ | Set-Content -Path $envFile -Encoding utf8
-# Restrict ACL on Windows when possible (best-effort)
-try {
-    icacls $envFile /inheritance:r /grant:r "$env:USERNAME:(R,W)" | Out-Null
-} catch { }
-Write-Host "Wrote $envFile"
+$vals = @{
+    CHUNKHOUND_MEMORY_DIR         = $MemoryDir
+    CHUNKHOUND_MEMORY_TOKEN       = $Token
+    CHUNKHOUND_MEMORY_HOST        = $HostName
+    CHUNKHOUND_MEMORY_PORT        = $Port
+    CHUNKHOUND_MEMORY_PUBLIC_HOST = $PublicHost
+}
+Write-MemoryEnvFile -Path $envFile -Values $vals
+Write-Host "Wrote $envFile (ACL restricted when possible)"
 
 Write-Host ""
 Write-Host "-> Client configuration snippets:"
@@ -155,7 +190,7 @@ Write-Host "============================================================"
 Write-Host " Next steps"
 Write-Host "============================================================"
 Write-Host "1. Start the server on this host:"
-Write-Host "     $($ScriptDir)\serve.ps1"
+Write-Host "     $($ScriptDir)\serve.ps1 -Dir `"$MemoryDir`""
 Write-Host ""
 Write-Host "2. MANUAL - open Windows Firewall for TCP $Port if other PCs connect:"
 Write-Host "     New-NetFirewallRule -DisplayName 'ChunkHound Memory' -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"

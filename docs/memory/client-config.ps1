@@ -26,72 +26,92 @@ if (-not $Url) {
 
 $displayHost = if ($HostName) { $HostName } else { "127.0.0.1" }
 
-Write-Host @"
-
-# ============================================================
-# ChunkHound Memory - client configs
-# URL: $Url
-# ============================================================
-
-## Generic (Cursor, VS Code, Grok Build, many others)
-
-``````json
-{
-  "mcpServers": {
-    "chunkhound-memory": {
-      "url": "$Url",
-      "headers": {
-        "Authorization": "Bearer $Token"
-      }
+# Escape JSON properly via Python
+$env:_CC_URL = $Url
+$env:_CC_TOKEN = $Token
+$env:_CC_HOST = $displayHost
+$env:_CC_PORT = $Port
+try {
+    python -c @"
+import json, os
+url = os.environ['_CC_URL']
+token = os.environ['_CC_TOKEN']
+host = os.environ['_CC_HOST']
+port = os.environ['_CC_PORT']
+cfg = {
+    'mcpServers': {
+        'chunkhound-memory': {
+            'url': url,
+            'headers': {'Authorization': 'Bearer ' + token},
+        }
     }
-  }
 }
-``````
-
-Some clients want an explicit transport type:
-
-``````json
-{
-  "mcpServers": {
-    "chunkhound-memory": {
-      "type": "http",
-      "url": "$Url",
-      "headers": {
-        "Authorization": "Bearer $Token"
-      }
+cfg_typed = {
+    'mcpServers': {
+        'chunkhound-memory': {
+            'type': 'http',
+            'url': url,
+            'headers': {'Authorization': 'Bearer ' + token},
+        }
     }
-  }
 }
-``````
-
-## Claude Code (CLI)
-
-``````powershell
-claude mcp add --transport http -s user chunkhound-memory ``
-  $Url ``
-  --header "Authorization: Bearer $Token"
-``````
-
-## Claude Desktop / Cowork (UI)
-
-1. Settings -> Integrations / MCP / Connectors -> Add custom
-2. Name: chunkhound-memory
-3. URL: $Url
-4. Header Authorization: Bearer $Token
-   (or X-ChunkHound-Token: $Token)
-
-## Health check
-
-``````powershell
-Invoke-RestMethod "http://${displayHost}:${Port}/health"
-``````
-
-## Manual steps you still do
-
-- Paste the JSON into each harness MCP settings (or run the Claude Code command).
-- On other machines, use this host's LAN IP, not 127.0.0.1.
-- Open firewall TCP $Port if clients are remote.
-- Do not run 'chunkhound memory mcp' against the same dir while serve is up.
-
-Full guide: docs/memory-setup.md
+print('# ============================================================')
+print('# ChunkHound Memory - client configs')
+print('# URL:', url)
+print('# ============================================================')
+print()
+print('## Generic (Cursor, VS Code, Grok Build, many others)')
+print()
+print('```json')
+print(json.dumps(cfg, indent=2))
+print('```')
+print()
+print('Some clients want an explicit transport type:')
+print()
+print('```json')
+print(json.dumps(cfg_typed, indent=2))
+print('```')
+print()
+print('## Claude Code (CLI)')
+print()
+print('```powershell')
+print('claude mcp add --transport http -s user chunkhound-memory ``')
+# PowerShell: avoid embedding token in a fragile string; show pattern
+print(f'  \"{url}\" ``')
+print(f'  --header \"Authorization: Bearer <paste-token>\"')
+print('```')
+print()
+print('(Use the same token as CHUNKHOUND_MEMORY_TOKEN / setup output.)')
+print()
+print('## Claude Desktop / Cowork (UI)')
+print()
+print('1. Settings -> Integrations / MCP / Connectors -> Add custom')
+print('2. Name: chunkhound-memory')
+print('3. URL:', url)
+print('4. Header Authorization: Bearer <token>')
+print('   (or X-ChunkHound-Token: <token>)')
+print()
+print('## Health check')
+print()
+print('```powershell')
+print(f'Invoke-RestMethod \"http://{host}:{port}/health\"')
+print('```')
+print()
+print('## Manual steps you still do')
+print()
+print('- Paste the JSON into each harness MCP settings (or run the Claude Code command).')
+print('- On other machines, use this host LAN IP, not 127.0.0.1.')
+print(f'- Open firewall TCP {port} if clients are remote.')
+print('- Do not run chunkhound memory mcp against the same dir while serve is up.')
+print()
+print('Full guide: docs/memory-setup.md')
 "@
+    if ($LASTEXITCODE -ne 0) {
+        throw "client-config generation failed (exit $LASTEXITCODE)"
+    }
+} finally {
+    Remove-Item Env:_CC_URL -ErrorAction SilentlyContinue
+    Remove-Item Env:_CC_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item Env:_CC_HOST -ErrorAction SilentlyContinue
+    Remove-Item Env:_CC_PORT -ErrorAction SilentlyContinue
+}

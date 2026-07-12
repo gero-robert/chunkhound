@@ -4,7 +4,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+REPO_ROOT="$(resolve_repo_root "$SCRIPT_DIR")"
 
 prompt() {
   local msg="$1"
@@ -88,19 +91,28 @@ if [[ -n "$PROVIDER" ]]; then
   if [[ -z "$API_KEY" ]]; then
     echo "No API key entered — leaving embedding config unchanged."
   else
-    python3 - "$CONFIG" "$PROVIDER" "$API_KEY" "$MODEL" <<'PY'
-import json, sys
+    # Pass key via env (not argv) so it is not visible in ps
+    export CHUNKHOUND_SETUP_EMBED_CONFIG="$CONFIG"
+    export CHUNKHOUND_SETUP_EMBED_PROVIDER="$PROVIDER"
+    export CHUNKHOUND_SETUP_EMBED_API_KEY="$API_KEY"
+    export CHUNKHOUND_SETUP_EMBED_MODEL="$MODEL"
+    python3 <<'PY'
+import json, os
 from pathlib import Path
-path, provider, api_key, model = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+path = Path(os.environ["CHUNKHOUND_SETUP_EMBED_CONFIG"])
 data = json.loads(path.read_text(encoding="utf-8"))
 data["embedding"] = {
-    "provider": provider,
-    "api_key": api_key,
-    "model": model,
+    "provider": os.environ["CHUNKHOUND_SETUP_EMBED_PROVIDER"],
+    "api_key": os.environ["CHUNKHOUND_SETUP_EMBED_API_KEY"],
+    "model": os.environ["CHUNKHOUND_SETUP_EMBED_MODEL"],
 }
 path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-print(f"Updated embedding provider={provider} model={model} in {path}")
+print(f"Updated embedding provider={data['embedding']['provider']} "
+      f"model={data['embedding']['model']} in {path}")
 PY
+    unset CHUNKHOUND_SETUP_EMBED_API_KEY CHUNKHOUND_SETUP_EMBED_PROVIDER
+    unset CHUNKHOUND_SETUP_EMBED_MODEL CHUNKHOUND_SETUP_EMBED_CONFIG
+    restrict_file_mode "$CONFIG"
   fi
 else
   echo ""
@@ -110,12 +122,12 @@ fi
 echo ""
 if yes_no "Re-index memory directory with embeddings now?" "y"; then
   echo "→ Indexing (may take a minute)..."
-  uv run chunkhound index "$MEMORY_DIR" \
+  if ! uv run chunkhound index "$MEMORY_DIR" \
     --config "$CONFIG" \
-    --db "$MEMORY_DIR/.chunkhound/db" || {
-      echo "Index failed. Fix embeddings/config and run:"
-      echo "  uv run chunkhound index \"$MEMORY_DIR\" --config \"$CONFIG\" --db \"$MEMORY_DIR/.chunkhound/db\""
-    }
+    --db "$MEMORY_DIR/.chunkhound/db"; then
+    echo "Index failed. Fix embeddings/config and run:"
+    echo "  uv run chunkhound index \"$MEMORY_DIR\" --config \"$CONFIG\" --db \"$MEMORY_DIR/.chunkhound/db\""
+  fi
 else
   echo "MANUAL later:"
   echo "  uv run chunkhound index \"$MEMORY_DIR\" --config \"$CONFIG\" --db \"$MEMORY_DIR/.chunkhound/db\""
@@ -125,9 +137,42 @@ echo ""
 echo "LAN serve settings"
 HOST="$(prompt "Bind host (0.0.0.0 = all interfaces)" "0.0.0.0")"
 PORT="$(prompt "Port" "8765")"
-if [[ -n "${CHUNKHOUND_MEMORY_TOKEN:-}" ]]; then
+validate_port "$PORT"
+
+# Reuse existing token from env file or process env by default
+EXISTING_TOKEN=""
+ENV_FILE="$MEMORY_DIR/memory-serve.env"
+if [[ -f "$ENV_FILE" ]]; then
+  CHUNKHOUND_MEMORY_TOKEN=""
+  load_memory_env_file "$ENV_FILE"
+  EXISTING_TOKEN="${CHUNKHOUND_MEMORY_TOKEN:-}"
+fi
+if [[ -z "$EXISTING_TOKEN" && -n "${CHUNKHOUND_MEMORY_TOKEN:-}" ]]; then
+  EXISTING_TOKEN="$CHUNKHOUND_MEMORY_TOKEN"
+fi
+
+if [[ -n "$EXISTING_TOKEN" ]]; then
+  echo "Found existing token in env file or environment."
+  if yes_no "Reuse existing token? (n = generate/rotate — breaks existing clients)" "y"; then
+    TOKEN="$EXISTING_TOKEN"
+    echo "Reusing existing token."
+  else
+    echo "WARNING: Rotating the token invalidates every harness config using the old one."
+    if yes_no "Generate a new random token?" "y"; then
+      if command -v openssl >/dev/null 2>&1; then
+        TOKEN="$(openssl rand -hex 32)"
+      else
+        TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+      fi
+      echo "Generated token (store safely; shown once here):"
+      echo "  $TOKEN"
+    else
+      TOKEN="$(prompt_secret "Enter new token (input hidden)")"
+    fi
+  fi
+elif [[ -n "${CHUNKHOUND_MEMORY_TOKEN:-}" ]]; then
   TOKEN="$CHUNKHOUND_MEMORY_TOKEN"
-  echo "Using existing CHUNKHOUND_MEMORY_TOKEN from environment."
+  echo "Using CHUNKHOUND_MEMORY_TOKEN from environment."
 else
   if yes_no "Generate a random API token?" "y"; then
     if command -v openssl >/dev/null 2>&1; then
@@ -135,32 +180,30 @@ else
     else
       TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
     fi
-    echo "Generated token (store safely): $TOKEN"
+    echo "Generated token (store safely; shown once here):"
+    echo "  $TOKEN"
   else
     TOKEN="$(prompt_secret "Enter token (input hidden)")"
   fi
 fi
 
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: empty token not allowed." >&2
+  exit 1
+fi
+
 PUBLIC_HOST="$(prompt "Hostname/IP other machines should use (for printed configs)" "127.0.0.1")"
 
-ENV_FILE="$MEMORY_DIR/memory-serve.env"
-# Values quoted for paths with spaces; serve.sh sources this file.
-cat > "$ENV_FILE" <<EOF
-# Generated by docs/memory/setup.sh — used by serve.sh / serve.ps1
 CHUNKHOUND_MEMORY_DIR="$MEMORY_DIR"
 CHUNKHOUND_MEMORY_TOKEN="$TOKEN"
 CHUNKHOUND_MEMORY_HOST="$HOST"
 CHUNKHOUND_MEMORY_PORT="$PORT"
 CHUNKHOUND_MEMORY_PUBLIC_HOST="$PUBLIC_HOST"
-EOF
-chmod 600 "$ENV_FILE" 2>/dev/null || true
-echo "Wrote $ENV_FILE"
+write_memory_env_file "$ENV_FILE"
+echo "Wrote $ENV_FILE (mode 600 when supported)"
 
 echo ""
 echo "→ Client configuration snippets:"
-export CHUNKHOUND_MEMORY_TOKEN="$TOKEN"
-export CHUNKHOUND_MEMORY_PORT="$PORT"
-export CHUNKHOUND_MEMORY_PUBLIC_HOST="$PUBLIC_HOST"
 bash "$SCRIPT_DIR/client-config.sh" --host "$PUBLIC_HOST" --port "$PORT" --token "$TOKEN"
 
 echo ""
@@ -168,8 +211,7 @@ echo "============================================================"
 echo " Next steps"
 echo "============================================================"
 echo "1. Start the server on this host:"
-echo "     $SCRIPT_DIR/serve.sh"
-echo "   (or: bash $SCRIPT_DIR/serve.sh --dir \"$MEMORY_DIR\")"
+echo "     $SCRIPT_DIR/serve.sh --dir \"$MEMORY_DIR\""
 echo ""
 echo "2. MANUAL — open firewall TCP $PORT if other PCs will connect."
 echo ""
@@ -184,7 +226,7 @@ echo "5. Optional LLM for better memory_research summaries: edit $CONFIG"
 echo "   and add an \"llm\" block (see chunkhound.ai configuration docs)."
 echo ""
 if yes_no "Start memory serve now?" "n"; then
-  exec bash "$SCRIPT_DIR/serve.sh" --dir "$MEMORY_DIR" --host "$HOST" --port "$PORT" --token "$TOKEN"
+  exec bash "$SCRIPT_DIR/serve.sh" --dir "$MEMORY_DIR" --host "$HOST" --port "$PORT"
 fi
 
 echo "Done. Full guide: docs/memory-setup.md"

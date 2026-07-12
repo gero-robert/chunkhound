@@ -5,9 +5,13 @@ Companion automation for [../memory-setup.md](../memory-setup.md).
 | Script | Purpose |
 |--------|---------|
 | `setup.sh` / `setup.ps1` | Interactive: init dir, embeddings, index, token, write `memory-serve.env`, print client configs |
-| `serve.sh` / `serve.ps1` | Start `chunkhound memory serve` (loads `memory-serve.env`) |
-| `client-config.sh` / `client-config.ps1` | Print MCP JSON / Claude Code command for harnesses |
+| `serve.sh` / `serve.ps1` | Start `chunkhound memory serve` (loads `memory-serve.env` with a **strict allowlist parser**, never `source`/execute) |
+| `client-config.sh` / `client-config.ps1` | Print MCP JSON / Claude Code command (JSON-escaped) |
+| `_lib.sh` / `_lib.ps1` | Shared helpers (env parse/write, repo root, ACL) |
 | `env.example` | Template for `memory-serve.env` |
+
+**Env load precedence:** CLI flags → process environment → `memory-serve.env` → defaults.  
+**Token:** passed via environment to `chunkhound memory serve` (not argv). Setup reuses an existing token by default.
 
 ## Quick start
 
@@ -30,7 +34,9 @@ chmod +x docs/memory/*.sh
 ./docs/memory/serve.sh
 ```
 
-Scripts always `uv run` from the **repository root** (parent of `docs/`). Run them from a full clone of this branch.
+Scripts always `uv run` from the **repository root** (parent of `docs/`). Run them from a full clone of this branch. Override with `CHUNKHOUND_REPO` if needed.
+
+Self-check (Windows): `powershell -ExecutionPolicy Bypass -File docs/memory/_selftest.ps1`
 
 ## What is automated vs manual
 

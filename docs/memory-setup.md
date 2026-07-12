@@ -161,14 +161,16 @@ Windows (PowerShell):
 
 ```powershell
 $env:CHUNKHOUND_MEMORY_DIR = "D:\data\chunkhound-memory"
-$env:CHUNKHOUND_MEMORY_TOKEN = -join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
-# Prefer a known secret you store in a password manager, not a one-liner random.
+# Cryptographically secure token (prefer password manager storage):
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$env:CHUNKHOUND_MEMORY_TOKEN = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
 
+# Prefer env for the token (not --token) so it is less visible in process listings.
 uv run chunkhound memory serve `
   --dir $env:CHUNKHOUND_MEMORY_DIR `
   --host 0.0.0.0 `
-  --port 8765 `
-  --token $env:CHUNKHOUND_MEMORY_TOKEN
+  --port 8765
 ```
 
 On startup the server prints client config snippets. Endpoints:
