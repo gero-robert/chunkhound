@@ -21,15 +21,12 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Protocol, TYPE_CHECKING, cast
-
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from chunkhound.services.directory_indexing_service import IndexingStats
 
 from loguru import logger
-
-from chunkhound.utils.logging_guard import log_if_not_mcp
 from rich.progress import Progress, TaskID
 
 from chunkhound.core.detection import detect_language
@@ -59,6 +56,7 @@ from chunkhound.utils.file_patterns import (
     walk_subtree_worker,
 )
 from chunkhound.utils.hashing import compute_file_hash
+from chunkhound.utils.logging_guard import log_if_not_mcp
 
 from .base_service import BaseService
 from .batch_processor import ParsedFileResult, process_file_batch
@@ -1785,11 +1783,15 @@ class IndexingCoordinator(BaseService):
             log_if_not_mcp("error", f"Database compact_if_needed failed: {e}")
             return {"status": "error", "compacted": False, "error": str(e)}
 
-    async def remove_file(self, file_path: str) -> int:
+    async def remove_file(
+        self, file_path: str, *, raise_on_error: bool = False
+    ) -> int:
         """Remove a file and all its chunks from the database.
 
         Args:
             file_path: Path to the file to remove
+            raise_on_error: When True, propagate failures instead of returning 0.
+                Not-found still returns 0 (idempotent soft-delete).
 
         Returns:
             Number of chunks removed
@@ -1807,6 +1809,10 @@ class IndexingCoordinator(BaseService):
             # Get file ID
             file_id = self._extract_file_id(file_record)
             if file_id is None:
+                if raise_on_error:
+                    raise RuntimeError(
+                        f"Index record missing file id for {relative_path}"
+                    )
                 return 0
 
             # Count chunks before deletion
@@ -1819,10 +1825,17 @@ class IndexingCoordinator(BaseService):
             # Clean up the file lock since the file no longer exists
             if success:
                 self._cleanup_file_lock(Path(file_path))
+                return chunk_count
 
-            return chunk_count if success else 0
+            if raise_on_error:
+                raise RuntimeError(
+                    f"Failed to delete file from index: {relative_path}"
+                )
+            return 0
 
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.error(f"Failed to remove file {file_path}: {e}")
             return 0
 

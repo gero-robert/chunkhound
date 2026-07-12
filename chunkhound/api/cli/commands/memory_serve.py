@@ -3,77 +3,23 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import os
 import secrets
 import sys
-from pathlib import Path
 
 from chunkhound.services.memory.paths import (
     ENV_MEMORY_DIR,
     resolve_memory_dir,
     validate_memory_dir,
 )
+from chunkhound.services.memory.process_lock import (
+    acquire_memory_lock,
+    release_memory_lock,
+)
 
 ENV_MEMORY_TOKEN = "CHUNKHOUND_MEMORY_TOKEN"
 ENV_MEMORY_HOST = "CHUNKHOUND_MEMORY_HOST"
 ENV_MEMORY_PORT = "CHUNKHOUND_MEMORY_PORT"
-PID_FILE_NAME = "memory-serve.pid"
-
-
-def _pid_file(memory_dir: Path) -> Path:
-    return memory_dir / ".chunkhound" / PID_FILE_NAME
-
-
-def _write_pid_file(memory_dir: Path) -> Path:
-    """Create an exclusive PID lock file, reclaiming only stale locks."""
-    from chunkhound.daemon.process import pid_alive
-
-    path = _pid_file(memory_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # If a lock exists and the process is still alive, refuse.
-    if path.is_file():
-        try:
-            old_pid = int(path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            old_pid = -1
-        if old_pid > 0 and pid_alive(old_pid):
-            raise RuntimeError(
-                f"Another memory serve appears to be running (pid={old_pid}, "
-                f"pidfile={path}). Stop it before starting a new server."
-            )
-        # Stale lock — remove before exclusive create
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Could not remove stale memory serve pidfile {path}: {exc}"
-            ) from exc
-
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    try:
-        fd = os.open(str(path), flags, 0o644)
-    except FileExistsError as exc:
-        raise RuntimeError(
-            f"Another memory serve is starting (pidfile={path}). "
-            "Stop it before starting a new server."
-        ) from exc
-    try:
-        os.write(fd, str(os.getpid()).encode("utf-8"))
-    finally:
-        os.close(fd)
-    return path
-
-
-def _remove_pid_file(path: Path) -> None:
-    try:
-        if path.is_file():
-            content = path.read_text(encoding="utf-8").strip()
-            if content == str(os.getpid()):
-                path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _resolve_token(args: argparse.Namespace) -> str:
@@ -127,7 +73,6 @@ async def memory_serve_command(args: argparse.Namespace) -> None:
     if host in {"0.0.0.0", "::"} and not (
         getattr(args, "token", None) or os.environ.get(ENV_MEMORY_TOKEN)
     ):
-        # Generated token is fine, but warn about LAN exposure
         sys.stderr.write(
             "WARNING: Binding to all interfaces with a generated token. "
             "Prefer setting CHUNKHOUND_MEMORY_TOKEN for a stable secret.\n"
@@ -139,12 +84,10 @@ async def memory_serve_command(args: argparse.Namespace) -> None:
     os.environ["CHUNKHOUND_DAEMON_MODE"] = "false"
 
     try:
-        pid_path = _write_pid_file(memory_dir)
+        lock_path = acquire_memory_lock(memory_dir, mode="memory-serve")
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
-
-    atexit.register(_remove_pid_file, pid_path)
 
     args.path = memory_dir
     args.no_daemon = True
@@ -158,6 +101,7 @@ async def memory_serve_command(args: argparse.Namespace) -> None:
 
     config, validation_errors = create_validated_config(args, "mcp")
     if validation_errors:
+        release_memory_lock(lock_path)
         msg = "; ".join(str(error) for error in validation_errors)
         _respond_with_startup_error(Exception(f"Configuration errors: {msg}"), config)
         sys.exit(1)
@@ -165,9 +109,15 @@ async def memory_serve_command(args: argparse.Namespace) -> None:
     try:
         server = MemoryMCPServer(config, memory_dir, args=args)
         print_client_setup(host, port, token, memory_dir)
+        sys.stderr.write(
+            "Single-owner mode: this process owns the memory DB. "
+            "On this machine and others, attach harnesses via the HTTP URL above "
+            "(do not also run `chunkhound memory mcp` against the same dir).\n"
+        )
+        sys.stderr.flush()
         await run_memory_http(server, host=host, port=port, token=token)
     except Exception as exc:
         _respond_with_startup_error(exc, config)
         sys.exit(1)
     finally:
-        _remove_pid_file(pid_path)
+        release_memory_lock(lock_path)

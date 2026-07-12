@@ -50,10 +50,17 @@ Body text with rationale and file pointers.
 
 ## LAN shared server
 
-On the always-on host:
+On the always-on host (single owner of the DuckDB index):
 
 ```bash
 chunkhound memory serve --dir /path/to/memory --host 0.0.0.0 --port 8765 --token <secret>
 ```
 
-Clients on any machine point their MCP config at `http://<host-lan-ip>:8765/mcp` with `Authorization: Bearer <secret>`.
+**All clients** — including harnesses on the same machine — connect via HTTP:
+
+`http://<host-lan-ip>:8765/mcp` with `Authorization: Bearer <secret>`  
+(or `http://127.0.0.1:8765/mcp` on the host itself).
+
+Do **not** also run `chunkhound memory mcp` (stdio) against the same directory while
+serve is running: only one process may own the memory database. Prefer serve for
+multi-harness / multi-machine use.

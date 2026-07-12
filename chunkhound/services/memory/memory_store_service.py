@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,14 @@ _TYPE_TO_DIR = {
     "lesson": "lessons",
     "failure": "lessons",
     "decision": "decisions",
+}
+
+_TYPE_SHORT = {
+    "user_preference": "pref",
+    "skill": "skill",
+    "lesson": "lesson",
+    "failure": "fail",
+    "decision": "dec",
 }
 
 _CONFIDENCE = frozenset({"low", "medium", "high"})
@@ -66,6 +75,15 @@ def _subdir_for_type(entry_type: str) -> str:
             f"Unsupported memory type '{entry_type}'. "
             f"Expected one of: {', '.join(sorted(MEMORY_TYPES))}"
         ) from exc
+
+
+def _is_archived_relative(memory_dir: Path, path: Path) -> bool:
+    """True when *path* is under memory_dir/archive/ (relative check only)."""
+    try:
+        rel = path.resolve().relative_to(memory_dir.resolve())
+    except ValueError:
+        return False
+    return bool(rel.parts) and rel.parts[0] == "archive"
 
 
 def _render_markdown(
@@ -129,6 +147,24 @@ def _ensure_inside_memory_dir(memory_dir: Path, path: Path) -> Path:
     return resolved
 
 
+def _entry_id_taken(memory_dir: Path, entry_id: str) -> bool:
+    """True if any non-archive markdown uses this id as stem or frontmatter id."""
+    root = memory_dir.resolve()
+    for path in root.rglob("*.md"):
+        if _is_archived_relative(root, path):
+            continue
+        if path.stem == entry_id:
+            return True
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = _peek_frontmatter(text)
+        if meta.get("id") == entry_id:
+            return True
+    return False
+
+
 def _resolve_memory_file(memory_dir: Path, path_or_id: str) -> Path:
     """Resolve a relative path or entry id to an existing memory file."""
     root = memory_dir.resolve()
@@ -151,23 +187,36 @@ def _resolve_memory_file(memory_dir: Path, path_or_id: str) -> Path:
     if relative.is_file():
         return relative
 
-    # Match by frontmatter id or filename stem (exact)
+    # Match by frontmatter id or filename stem (exact); require uniqueness
     needle = raw
+    matches: list[Path] = []
     for path in root.rglob("*.md"):
         try:
             resolved = _ensure_inside_memory_dir(root, path)
         except ValueError:
             continue
-        if resolved.stem == needle or resolved.name == needle:
-            return resolved
-        try:
-            text = resolved.read_text(encoding="utf-8")
-        except OSError:
+        if _is_archived_relative(root, resolved):
             continue
-        meta = _peek_frontmatter(text)
-        if meta.get("id") == needle:
-            return resolved
+        hit = resolved.stem == needle or resolved.name == needle
+        if not hit:
+            try:
+                text = resolved.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            meta = _peek_frontmatter(text)
+            hit = meta.get("id") == needle
+        if hit:
+            matches.append(resolved)
 
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        paths = ", ".join(
+            str(m.relative_to(root)).replace("\\", "/") for m in matches[:5]
+        )
+        raise ValueError(
+            f"Ambiguous memory id {needle!r} matches multiple files: {paths}"
+        )
     raise FileNotFoundError(f"Memory entry not found: {path_or_id}")
 
 
@@ -205,24 +254,28 @@ class MemoryStoreService:
             raise ValueError("confidence must be one of: low, medium, high")
 
         tag_list = _normalize_tags(tags)
-        now = datetime.now(timezone.utc)
-        learned_at = date.today().isoformat()
-        base_id = (
-            f"{now.strftime('%Y%m%d-%H%M%S')}-"
-            f"{now.microsecond // 1000:03d}-"
-            f"{_slugify(title)}"
-        )
         subdir = _subdir_for_type(entry_type)
         target_dir = self.memory_dir / subdir
         target_dir.mkdir(parents=True, exist_ok=True)
+        type_tag = _TYPE_SHORT.get(entry_type, "mem")
 
         async with _WRITE_LOCK:
+            now = datetime.now(timezone.utc)
+            learned_at = now.date().isoformat()
+            base_id = (
+                f"{now.strftime('%Y%m%d-%H%M%S')}-"
+                f"{now.microsecond // 1000:03d}-"
+                f"{type_tag}-"
+                f"{_slugify(title)}"
+            )
             entry_id = base_id
             target_path = target_dir / f"{entry_id}.md"
             suffix = 0
-            while target_path.exists():
+            while target_path.exists() or _entry_id_taken(self.memory_dir, entry_id):
                 suffix += 1
-                entry_id = f"{base_id}-{suffix}"
+                # Random component avoids cross-type / cross-client races
+                token = secrets.token_hex(2)
+                entry_id = f"{base_id}-{suffix}-{token}"
                 target_path = target_dir / f"{entry_id}.md"
 
             content = _render_markdown(
@@ -255,7 +308,7 @@ class MemoryStoreService:
         async with _WRITE_LOCK:
             source = _resolve_memory_file(self.memory_dir, path_or_id)
             rel_src = str(source.relative_to(self.memory_dir)).replace("\\", "/")
-            if "archive" in source.parts:
+            if _is_archived_relative(self.memory_dir, source):
                 return ArchiveResult(
                     path=rel_src,
                     archived_path=rel_src,
@@ -275,7 +328,8 @@ class MemoryStoreService:
         # Soft-delete from the index: remove old path rows. Do NOT reindex archive/.
         try:
             chunks_removed = await services.indexing_coordinator.remove_file(
-                str(source)
+                str(source),
+                raise_on_error=True,
             )
             return ArchiveResult(
                 path=rel_src,
@@ -290,7 +344,9 @@ class MemoryStoreService:
                 archived_path=rel_dest,
                 indexed=False,
                 chunks_removed=0,
-                error=str(exc),
+                error=(
+                    f"File moved to {rel_dest} but index cleanup failed: {exc}"
+                ),
             )
 
     async def list_entries(
@@ -304,7 +360,7 @@ class MemoryStoreService:
         for path in self.memory_dir.rglob("*.md"):
             if path.name in {"MEMORY_PROTOCOL.md"}:
                 continue
-            if path.parent.name == "archive" or "archive" in path.parts:
+            if _is_archived_relative(self.memory_dir, path):
                 continue
             if path.suffix == ".tmp":
                 continue
@@ -368,23 +424,13 @@ class MemoryStoreService:
         embeddings_skipped = bool(result.get("embeddings_skipped"))
         embedding_error = result.get("embedding_error")
         embeddings_generated = int(result.get("embeddings_generated") or 0)
+        # indexed chunks may exist without embeddings (no provider / embed error)
         embeddings_ok = (
             status == "success"
             and not embeddings_skipped
             and not embedding_error
             and embeddings_generated > 0
         )
-        # No provider configured: chunks indexed, embeddings intentionally absent
-        if (
-            status == "success"
-            and not embeddings_skipped
-            and not embedding_error
-            and embeddings_generated == 0
-            and chunks > 0
-        ):
-            # process_file succeeds with 0 embeddings when no chunks need embed
-            # or provider missing — treat as ok-if-skipped only when skipped flag set
-            embeddings_ok = False
 
         if status in {"error", "skipped"}:
             return StoreResult(
@@ -404,9 +450,9 @@ class MemoryStoreService:
             indexed=status == "success",
             embeddings_ok=embeddings_ok,
             chunks=chunks,
-            error=str(embedding_error) if embedding_error else (
-                str(error) if error else None
-            ),
+            error=str(embedding_error)
+            if embedding_error
+            else (str(error) if error else None),
         )
 
 
