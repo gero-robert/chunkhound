@@ -6,6 +6,35 @@ Agent **usage policy** (when to research, store, approve skills, archive) is **n
 
 ---
 
+## Automated setup (recommended)
+
+Scripts live next to this doc under [`docs/memory/`](memory/README.md). Run them from a **clone of this repo** (they call `uv run` at the repo root).
+
+| Platform | First-time setup | Start server later | Print client configs only |
+|----------|------------------|--------------------|---------------------------|
+| **Windows** | `.\docs\memory\setup.ps1` | `.\docs\memory\serve.ps1` | `.\docs\memory\client-config.ps1` |
+| **Linux / macOS** | `chmod +x docs/memory/*.sh && ./docs/memory/setup.sh` | `./docs/memory/serve.sh` | `./docs/memory/client-config.sh` |
+
+What **setup** does for you:
+
+1. Prompts for memory directory  
+2. Runs `chunkhound memory init`  
+3. Prompts for embedding provider + API key → writes `.chunkhound.json`  
+4. Optional re-index  
+5. Generates token / host / port → writes `<memory-dir>/memory-serve.env`  
+6. Prints MCP JSON and Claude Code commands  
+
+What **you still do manually** (scripts say so when relevant):
+
+- Open the host firewall for the serve port  
+- Paste client config into Claude Code / Cowork / Grok Build / Cursor / VS Code (or run the printed `claude mcp add` command)  
+- Optional: add an `llm` block for better research summaries  
+- Optional: register serve with systemd / Task Scheduler for auto-start  
+
+The rest of this document is the **manual / detailed** reference if you prefer not to use the scripts.
+
+---
+
 ## What you are setting up
 
 | Piece | Role |

@@ -41,6 +41,7 @@ Your AI assistant searches code but doesn't understand it. ChunkHound researches
 
 **Agent Memory MCP (this branch):** multi-machine shared long-term memory for coding agents.
 - [Memory setup & client connections](docs/memory-setup.md) — init, `memory serve`, Claude Code / Cowork / Grok Build / Cursor / VS Code
+- [Setup scripts](docs/memory/README.md) — interactive `setup.ps1` / `setup.sh`, `serve.*`, client config printers
 
 ## Requirements
 
