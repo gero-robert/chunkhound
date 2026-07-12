@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
-from chunkhound.api.cli.commands.memory_init import _PROTOCOL_SNIPPET, memory_init_command
+from chunkhound.api.cli.commands.memory_init import (
+    _PROTOCOL_SNIPPET,
+    memory_init_command,
+)
 from chunkhound.services.memory.paths import ENV_MEMORY_DIR, resolve_memory_dir
 
 
 @pytest.mark.asyncio
-async def test_memory_init_creates_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_memory_init_creates_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     memory_dir = tmp_path / "memory"
     monkeypatch.setattr(
         "chunkhound.api.cli.commands.memory_init.resolve_memory_dir",
@@ -39,8 +43,12 @@ async def test_memory_init_creates_layout(tmp_path: Path, monkeypatch: pytest.Mo
     assert "memory_research" in protocol
     assert "memory_semantic_search" in protocol
     assert "memory_store" in protocol
-    for line in _PROTOCOL_SNIPPET.split("\n"):
-        assert line in protocol
+    assert "Session start" in protocol
+    assert "approval" in protocol.lower()
+    assert "memory_archive" in protocol
+    # Init stdout snippet is a short digest of the same policy
+    assert "memory_research" in _PROTOCOL_SNIPPET
+    assert "skill" in _PROTOCOL_SNIPPET.lower()
 
     config = json.loads((memory_dir / ".chunkhound.json").read_text(encoding="utf-8"))
     assert config["indexing"]["chunker"] == "prose"
@@ -52,7 +60,9 @@ async def test_memory_init_creates_layout(tmp_path: Path, monkeypatch: pytest.Mo
     assert preference_path.read_text(encoding="utf-8") == "custom preference content"
 
 
-def test_resolve_memory_dir_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_memory_dir_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cli_dir = tmp_path / "from-cli"
     env_dir = tmp_path / "from-env"
 

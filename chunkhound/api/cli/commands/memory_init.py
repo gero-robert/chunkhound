@@ -9,10 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from chunkhound.services.memory.agent_protocol import (
+    build_memory_protocol_markdown,
+    protocol_snippet_for_init,
+)
 from chunkhound.services.memory.paths import (
     ENV_MEMORY_DIR,
     resolve_memory_dir,
 )
+
+_PROTOCOL_SNIPPET = protocol_snippet_for_init()
 
 
 def _template_dir() -> Path:
@@ -22,18 +28,6 @@ def _template_dir() -> Path:
         return Path(str(files("chunkhound.services.memory").joinpath("templates")))
     except Exception:
         return Path(__file__).resolve().parents[3] / "services" / "memory" / "templates"
-
-
-_PROTOCOL_SNIPPET = (
-    "ALWAYS start by calling memory_research with a query derived from the current "
-    "user request plus any known user preferences.\n"
-    "After important decisions, patterns, failures, or durable prefs, call "
-    "memory_store so other machines/sessions share the knowledge.\n"
-    "Prefer memory_research first (summarized insight); use memory_semantic_search "
-    "only when you need raw entries.\n"
-    "Use memory_archive for obsolete entries that mislead recall.\n"
-    "Store pointers and trade-offs, not large source dumps."
-)
 
 
 def _memory_config(memory_dir: Path) -> dict[str, object]:
@@ -54,8 +48,15 @@ def _copy_templates(memory_dir: Path) -> None:
     for subdir in ("preferences", "skills", "lessons", "decisions", "archive"):
         (memory_dir / subdir).mkdir(parents=True, exist_ok=True)
 
+    # Always refresh protocol from the canonical agent_protocol module so
+    # on-disk MEMORY_PROTOCOL.md matches MCP server instructions.
+    protocol_path = memory_dir / "MEMORY_PROTOCOL.md"
+    protocol_path.write_text(
+        build_memory_protocol_markdown(str(memory_dir)) + "\n",
+        encoding="utf-8",
+    )
+
     seed_files = (
-        ("MEMORY_PROTOCOL.md", memory_dir / "MEMORY_PROTOCOL.md"),
         ("user_preference.md", memory_dir / "preferences" / "user_preference.md"),
         ("skill.md", memory_dir / "skills" / "skill.md"),
         ("lesson.md", memory_dir / "lessons" / "lesson.md"),

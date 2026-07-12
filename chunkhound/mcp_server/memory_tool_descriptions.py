@@ -1,122 +1,169 @@
-"""Self-contained MCP tool descriptions for the Memory server."""
+"""Self-contained MCP tool descriptions for the Memory server.
+
+Each description includes the shared usage policy so a model that only reads
+tool schemas still knows when/how to use memory. Full detail is also in
+server ``instructions`` at initialize (see agent_protocol).
+"""
 
 from __future__ import annotations
 
-_PROTOCOL = (
-    "ALWAYS start by calling memory_research with a query derived from the current "
-    "user request plus any known user preferences.\n"
-    "After important decisions, patterns, failures, or durable prefs, call "
-    "memory_store so other machines/sessions share the knowledge.\n"
-    "Prefer memory_research first (summarized insight); use memory_semantic_search "
-    "only when you need raw entries.\n"
-    "Use memory_archive for obsolete entries that mislead recall.\n"
-    "Store pointers and trade-offs, not large source dumps."
-)
+from chunkhound.services.memory.agent_protocol import TOOL_PROTOCOL_SUMMARY
 
 
 def build_memory_research_description(memory_dir: str) -> str:
     """Build the memory_research tool description."""
-    return f"""ChunkHound Memory — shared long-term agent memory (NOT codebase search).
+    return f"""ChunkHound Memory — DEFAULT RECALL tool (shared long-term agent memory).
 
-MEMORY DIRECTORY: {memory_dir}
-Configure via CHUNKHOUND_MEMORY_DIR or `chunkhound memory init --dir PATH`.
-On LAN, connect via `chunkhound memory serve` URL instead of local files.
+NOT codebase search. Memory directory: {memory_dir}
 
-START HERE for every task. Returns a concise markdown summary of relevant
-preferences, skills, lessons, and decisions.
+{TOOL_PROTOCOL_SUMMARY}
 
-MANDATORY WORKFLOW:
-{_PROTOCOL}
+## This tool
+Synthesizes relevant preferences, skills, lessons, failures, and decisions into
+a concise actionable summary. **Call this first on every task**, and again
+mid-task when the domain shifts, you need a skill playbook, or before big
+decisions.
 
-WHEN TO USE:
-- Beginning of every user task
-- Before making plans or writing code
-- When you need synthesized insight across many memory entries
+## When to call
+- Session / task start (mandatory)
+- Before planning or architecture choices
+- When stuck; when entering a new area; when a skill might apply
+- After the user states a durable preference (to see if one already exists)
 
-ARGS:
-- query (required): Combine the user request with known preferences
-- task_context (optional): Hints such as type words
-  (preference, skill, lesson, failure, decision), project:name, tag:name
+## Args
+- query (required): User request + domain, e.g.
+  "add retry to auth client — prefs, skills, decisions"
+- task_context (optional): hints like
+  `preference skill decision project:myapp tag:auth`
 
-WRITING NEW MEMORY:
-Call memory_store (preferred on shared server).
-Types: user_preference, skill, lesson, failure, decision.
-
-ENTRY TYPES:
-- user_preference — how the user wants you to behave
-- skill — how we do things here
-- lesson — what worked
-- failure — what did not work
-- decision — architecture trade-offs and choices
+## Tips
+- For full skill steps after a hit, follow with memory_semantic_search.
+- To browse skills: memory_list(type="skill").
+- To save new knowledge: memory_store (skills need user approval first).
+- To remove wrong/noisy entries: memory_archive.
 """
 
 
 def build_memory_semantic_search_description(memory_dir: str) -> str:
     """Build the memory_semantic_search tool description."""
-    return f"""ChunkHound Memory — raw semantic hits from the shared memory index.
+    return f"""ChunkHound Memory — VERBATIM recall (raw semantic hits).
 
-MEMORY DIRECTORY: {memory_dir}
+Memory directory: {memory_dir}
 
-Use only when memory_research lacks detail or you need verbatim entries.
+{TOOL_PROTOCOL_SUMMARY}
 
-MANDATORY WORKFLOW:
-{_PROTOCOL}
+## This tool
+Returns full chunk text + frontmatter metadata. Use when memory_research is too
+compressed or you need exact skill/procedure wording.
 
-WHEN TO USE:
-- memory_research summary is too vague
-- You need exact wording from a stored entry
-- Debugging which memory entry matched
+## When to call
+- Loading a full **skill** playbook to follow step-by-step
+- Verifying exact preference/decision wording
+- Finding path/id of an entry before memory_archive or superseding
+- Debugging which entry matched
 
-ARGS:
-- query (required): Natural language query against memory chunks
+## Args
+- query (required): Natural language query (skill title, decision topic, etc.)
 
-RETURNS: Markdown blocks with file path, line range, frontmatter metadata,
-and full chunk text.
+## Tips
+Prefer memory_research first for overview; use this for depth. Multiple searches
+per session are fine.
 """
 
 
 def build_memory_store_description(memory_dir: str) -> str:
     """Build the memory_store tool description."""
-    return f"""Create a durable memory entry on the shared server
-(writes Markdown + reindexes).
+    return f"""ChunkHound Memory — CREATE a durable shared entry (write + reindex).
 
-MEMORY DIRECTORY: {memory_dir}
+Memory directory: {memory_dir}
 
-Use after important work so other harnesses/machines can recall it.
+{TOOL_PROTOCOL_SUMMARY}
 
-ARGS:
+## This tool
+Writes Markdown with frontmatter and indexes it so all machines/harnesses can
+recall it. Use for durable institutional knowledge only.
+
+## When to store
+- user_preference: lasting behavior the user wants
+- decision: choice + alternatives rejected + why + path pointers
+- lesson / failure: what worked or failed, with enough context to reuse
+- skill: **ONLY after explicit user approval** of the drafted playbook
+
+## When NOT to store
+Secrets; huge code dumps; ephemeral task noise; unvalidated guesses;
+duplicates of still-accurate entries (research first).
+
+## Correcting memory
+Do not silently overwrite. **memory_archive** the bad entry, then store a
+corrected one mentioning what it supersedes. For skills, get user approval on
+material changes.
+
+## Args
 - type (required): user_preference | skill | lesson | failure | decision
-- title (required): Short heading
-- body (required): Actionable content — decisions, pointers, trade-offs
-  (not huge code dumps)
-- applies_to (optional): Scope string
+- title (required): Short searchable heading
+- body (required): Actionable content — steps, trade-offs, file pointers
+- applies_to (optional): Domain / workflow name
 - tags (optional): list of tags
 - confidence (optional): low | medium | high (default medium)
-- project (optional): project name for filtering
-- source (optional): harness/machine label
+- project (optional): project/repo name
+- source (optional): harness label
 
-RETURNS: path, id, indexed status.
+## Returns
+JSON with path, id, indexed, embeddings_ok — keep path/id if you may archive later.
 """
 
 
 def build_memory_archive_description(memory_dir: str) -> str:
     """Build the memory_archive tool description."""
-    return f"""Soft-delete a memory entry by moving it to archive/ under {memory_dir}.
+    return f"""ChunkHound Memory — SOFT-DELETE (remove from future recall).
 
-Use when an entry is obsolete or misleading. Prefer archive over rewriting history.
+Memory directory: {memory_dir}
 
-ARGS:
-- path_or_id (required): Relative path (e.g. lessons/foo.md) or entry id
+{TOOL_PROTOCOL_SUMMARY}
+
+## This tool
+Moves an entry under archive/ and removes it from the search index. Use when
+memory is wrong, obsolete, misleading, or the user asks to remove it.
+
+## When to archive
+- Inaccurate or outdated guidance (then store a correction if needed)
+- Completely irrelevant / noise that pollutes research results
+- Superseding a skill or decision (archive old → store new)
+- User explicitly requests deletion of a memory
+
+## When not to archive
+- Mild uncertainty — research alternatives first
+- Entries that are still partially useful; prefer a corrected store after archive
+  only when you have better text
+
+## Args
+- path_or_id (required): Relative path (e.g. skills/foo.md) or entry id
+  (from memory_semantic_search / memory_list / prior memory_store)
+
+## Note
+Soft-delete only; preferred over leaving contradictory high-confidence memories.
 """
 
 
 def build_memory_list_description(memory_dir: str) -> str:
     """Build the memory_list tool description."""
-    return f"""List recent memory entries under {memory_dir} (filesystem, not semantic).
+    return f"""ChunkHound Memory — BROWSE recent entries
+(filesystem order, not semantic).
 
-Use for debugging or browsing. Prefer memory_research for task-relevant recall.
+Memory directory: {memory_dir}
 
-ARGS:
-- type (optional): filter by entry type
+{TOOL_PROTOCOL_SUMMARY}
+
+## This tool
+Lists recent non-archived entries. Use to discover skills/decisions by type or
+to find a path/id for archive. Prefer memory_research for task-relevant recall.
+
+## When to call
+- "What skills do we have?" → type=skill
+- Find an id/path after research pointed at a title
+- Operator-style browsing of recent stores
+
+## Args
+- type (optional): user_preference | skill | lesson | failure | decision
 - limit (optional): max entries (default 20, max 100)
 """

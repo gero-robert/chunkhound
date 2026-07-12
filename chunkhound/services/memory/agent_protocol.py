@@ -1,3 +1,39 @@
+"""Single source of agent usage policy for ChunkHound Memory MCP.
+
+This module is the canonical text for:
+- MCP server ``instructions`` (sent at initialize)
+- Per-tool description prefixes
+- MEMORY_PROTOCOL.md template content
+- ``chunkhound memory init`` printed snippet
+
+Keep behavior rules here so agents never need external docs to use memory correctly.
+"""
+
+from __future__ import annotations
+
+# Compact block embedded in every tool description (always visible in tool lists).
+TOOL_PROTOCOL_SUMMARY = """\
+MEMORY USAGE POLICY (always follow):
+1) Session start: call memory_research with a query from the user request + domain
+   (preferences, skills, past decisions). Apply what you learn.
+2) Mid-task: call memory_research / memory_semantic_search again whenever you change
+   domain, get stuck, need a playbook (skill), or before major decisions. Multiple
+   recalls per session are expected and encouraged.
+3) Write with memory_store only for durable knowledge: prefs, decisions, lessons,
+   failures, and skills. Search first to avoid duplicates. No secrets; no huge code.
+4) NEW SKILLS: draft the skill, show the user, wait for explicit approval, THEN
+   memory_store type=skill. Never invent skills silently.
+5) Wrong memory: archive the bad entry (memory_archive) then store a corrected one
+   noting what it supersedes. Irrelevant memory: memory_archive only.
+6) Prefer memory_research for synthesis; memory_semantic_search for full skill text;
+   memory_list(type=...) to browse.
+   This is shared multi-machine memory, not code search.
+"""
+
+
+def build_server_instructions(memory_dir: str) -> str:
+    """Full server-level instructions returned at MCP initialize."""
+    return f"""\
 # ChunkHound Memory — agent operating manual
 
 You are connected to **ChunkHound Memory**: long-term, shared institutional memory
@@ -5,11 +41,10 @@ for coding agents across machines and harnesses. It is **not** codebase search
 (use project ChunkHound / code tools for source). Memory stores **how we work**,
 **what we decided**, **what failed**, and **approved skills** (playbooks).
 
-Memory directory (server-side): configured via CHUNKHOUND_MEMORY_DIR / memory init
+Memory directory (server-side): {memory_dir}
 
 This document is the **single source of config for how you use memory**. Follow it
-for the whole session. The same policy is injected as MCP server instructions and
-into every tool description.
+for the whole session.
 
 ---
 
@@ -17,11 +52,11 @@ into every tool description.
 
 | type | Purpose | Folder |
 |------|---------|--------|
-| user_preference | How the user wants you to behave (style, process, constraints) | preferences/ |
-| skill | Reusable playbook: steps the agent should follow for a class of work | skills/ |
+| user_preference | How the user wants you to behave | preferences/ |
+| skill | Reusable playbook for a class of work | skills/ |
 | lesson | What worked and should be repeated | lessons/ |
 | failure | What failed and should be avoided | lessons/ |
-| decision | Architecture / design choice + alternatives rejected + why | decisions/ |
+| decision | Design choice + rejected alternatives + why | decisions/ |
 
 Good entry content: short title, actionable body, **file/path pointers**, trade-offs,
 constraints, tags. Bad content: secrets, passwords, huge source dumps, ephemeral
@@ -95,7 +130,8 @@ Store only **durable** knowledge that future sessions on any machine should reus
 - Near-duplicates of an existing accurate entry (search first)
 
 Before store: **memory_research** or **memory_semantic_search** for similar entries.
-If a good entry already exists, do not spam duplicates—update via archive+store if needed.
+If a good entry already exists, do not spam duplicates —
+update via archive+store if needed.
 
 ### How to write a good entry
 
@@ -183,6 +219,14 @@ your current chat context. Be precise and self-contained.
 
 When unsure whether to store: ask the user, or research first; prefer under-storing
 noise over polluting shared memory.
+"""
+
+
+def build_memory_protocol_markdown(memory_dir: str = "~/.chunkhound-memory") -> str:
+    """Full MEMORY_PROTOCOL.md body for the memory directory template."""
+    # Reuse server instructions with a short ops appendix for humans.
+    core = build_server_instructions(memory_dir)
+    appendix = """
 
 ---
 
@@ -193,12 +237,14 @@ noise over polluting shared memory.
 On the always-on host (single owner of the DuckDB index):
 
 ```bash
-chunkhound memory serve --dir /path/to/memory --host 0.0.0.0 --port 8765 --token <secret>
+chunkhound memory serve --dir /path/to/memory \\
+  --host 0.0.0.0 --port 8765 --token <secret>
 ```
 
 All clients — including harnesses on the same machine — connect via HTTP:
 
-`http://<host-lan-ip>:8765/mcp` with `Authorization: Bearer <secret>`  
+`http://<host-lan-ip>:8765/mcp` with
+`Authorization: Bearer <secret>`
 (or `http://127.0.0.1:8765/mcp` on the host).
 
 Do **not** also run `chunkhound memory mcp` against the same directory while serve
@@ -228,3 +274,17 @@ id: 20260712-120000-000-dec-auth-retry
 
 Body with rationale and file pointers.
 ```
+"""
+    return core + appendix
+
+
+def protocol_snippet_for_init() -> str:
+    """Short printed snippet for `memory init` stdout."""
+    return (
+        "Session start: memory_research (query from user task + domain).\n"
+        "Mid-task: re-research skills/decisions/lessons as domains change.\n"
+        "Write durable prefs/decisions/lessons via memory_store; no secrets.\n"
+        "NEW SKILLS: draft → user approval → memory_store type=skill.\n"
+        "Wrong memory: memory_archive then store correction; noise: archive only.\n"
+        "Full policy is in MCP server instructions and MEMORY_PROTOCOL.md."
+    )

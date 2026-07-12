@@ -16,6 +16,7 @@ from chunkhound.mcp_server.memory_tools import (
     set_memory_tool_descriptions,
 )
 from chunkhound.mcp_server.stdio import _MCP_AVAILABLE, StdioMCPServer
+from chunkhound.services.memory.agent_protocol import build_server_instructions
 from chunkhound.version import __version__
 
 if _MCP_AVAILABLE:
@@ -39,7 +40,11 @@ class MemoryMCPServer(StdioMCPServer):
         else:
             from mcp.server import Server
 
-            self.server = Server("ChunkHound Memory")
+            # Server instructions = single source of usage policy for the model
+            self.server = Server(
+                "ChunkHound Memory",
+                instructions=build_server_instructions(str(self.memory_dir)),
+            )
             self._register_tools()
 
     def _build_filtered_tool_dicts(self) -> list[dict[str, Any]]:
@@ -124,6 +129,7 @@ class MemoryMCPServer(StdioMCPServer):
         init_options = InitializationOptions(
             server_name="ChunkHound Memory",
             server_version=__version__,
+            instructions=build_server_instructions(str(self.memory_dir)),
             capabilities=self.server.get_capabilities(
                 notification_options=NotificationOptions(),
                 experimental_capabilities={},
