@@ -6,7 +6,9 @@ from typing import Any
 
 import yaml
 
-MEMORY_TYPES = frozenset({"user_preference", "skill", "lesson", "failure"})
+MEMORY_TYPES = frozenset(
+    {"user_preference", "skill", "lesson", "failure", "decision"}
+)
 
 
 class FrontmatterExtractor:
@@ -72,5 +74,10 @@ class FrontmatterExtractor:
         confidence = raw.get("confidence")
         if isinstance(confidence, str) and confidence.strip():
             fields["confidence"] = confidence.strip().lower()
+
+        for key in ("project", "source", "id"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                fields[key] = value.strip()
 
         return fields

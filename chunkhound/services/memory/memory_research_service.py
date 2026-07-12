@@ -11,8 +11,9 @@ from chunkhound.services.memory.metadata_filter import filter_chunks_by_task_con
 
 _MEMORY_SYSTEM = (
     "You summarize agent long-term memory entries: user preferences, skills, "
-    "lessons, and failures. Be concise and actionable. Use bullet points. "
-    "Cite sources as [filename] when helpful. Do not invent entries."
+    "lessons, failures, and architecture decisions. Be concise and actionable. "
+    "Use bullet points. Cite sources as [filename] when helpful. "
+    "Do not invent entries."
 )
 
 
@@ -75,7 +76,8 @@ class MemoryResearchService:
             f"Task context: {task_context or '(none)'}\n\n"
             "Relevant memory chunks:\n"
             f"{chr(10).join(context_blocks) if context_blocks else '(no matches)'}\n\n"
-            "Summarize the preferences, skills, and lessons that matter for this task."
+            "Summarize the preferences, skills, lessons, failures, and "
+            "decisions that matter for this task."
         )
         provider = llm_manager.get_synthesis_provider()
         response = await provider.complete(

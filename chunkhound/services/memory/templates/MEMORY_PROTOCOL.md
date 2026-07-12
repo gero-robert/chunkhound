@@ -1,43 +1,59 @@
 # ChunkHound Memory Protocol
 
-This directory is your agent's long-term memory. ChunkHound indexes these files so MCP tools can retrieve preferences, skills, and lessons.
+This directory is your agents' long-term **shared** memory. ChunkHound indexes these files so MCP tools can retrieve preferences, skills, lessons, and decisions across machines and harnesses.
 
 ## Mandatory workflow
 
 ALWAYS start by calling memory_research with a query derived from the current user request plus any known user preferences.
-If you discover new information about how the user wants you to behave, or what worked/didn't work, append a new entry using the exact Markdown + YAML frontmatter format shown in the templates.
-You have two memory tools: prefer memory_research first (it gives summarized insight); use memory_semantic_search only when you need raw entries.
-Document which tool gave better results in your next learning entry so we can evolve the system.
+After important decisions, patterns, failures, or durable prefs, call memory_store so other machines/sessions share the knowledge.
+Prefer memory_research first (summarized insight); use memory_semantic_search only when you need raw entries.
+Use memory_archive for obsolete entries that mislead recall.
+Store pointers and trade-offs, not large source dumps.
 
 ## Reading memory
 
 1. Call `memory_research(query, task_context="")` at the start of every task.
 2. Use `memory_semantic_search(query)` only when you need verbatim raw entries.
+3. Optional `task_context` hints: type words (`preference`, `skill`, `lesson`, `failure`, `decision`), `project:name`, `tag:name`.
 
 ## Writing memory
 
-Append or create `.md` files under:
+**Preferred (shared LAN server):** call `memory_store` with type, title, and body.
+
+**Manual (host only):** append or create `.md` files under:
 
 - `preferences/` for `type: user_preference`
 - `skills/` for `type: skill`
 - `lessons/` for `type: lesson` or `type: failure`
+- `decisions/` for `type: decision`
 
-The realtime watcher re-indexes file changes automatically. No write tool is provided in v1.
+Archived entries live under `archive/` and are excluded from indexing.
 
 ## Entry format
 
 ```markdown
 ---
-type: user_preference
-applies_to: planning
-learned_at: 2026-07-03
-tags: [concise, bullets]
+type: decision
+applies_to: auth-retry
+learned_at: 2026-07-12
+tags: [duckdb, concurrency]
 confidence: high
+project: my-app
+source: cursor@desktop-a
+id: 20260712-120000-000-auth-retry
 ---
 
 ## Title
 
-Body text.
+Body text with rationale and file pointers.
 ```
 
-See the template files in this directory for examples.
+## LAN shared server
+
+On the always-on host:
+
+```bash
+chunkhound memory serve --dir /path/to/memory --host 0.0.0.0 --port 8765 --token <secret>
+```
+
+Clients on any machine point their MCP config at `http://<host-lan-ip>:8765/mcp` with `Authorization: Bearer <secret>`.
