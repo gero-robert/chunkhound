@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 
 from chunkhound.services.memory.paths import (
     ENV_MEMORY_DIR,
