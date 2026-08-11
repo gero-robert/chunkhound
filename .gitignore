@@ -341,3 +341,5 @@ profile_*.json
 .bench-full*/
 .bench-full-baseline/
 
+# Test artifacts (playwright, vitest, etc.)
+site/test-results/
