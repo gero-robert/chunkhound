@@ -147,6 +147,161 @@ def test_optimize_past_fragment_threshold_still_answers_semantic_search(
         provider.disconnect()
 
 
+class _Progress:
+    """Enough of Rich Progress for the Rust phase callback to record compaction."""
+
+    def __init__(self):
+        self._next = 0
+        self.tasks = {}
+
+    def add_task(self, *_args, **kwargs):
+        self._next += 1
+        task_id = self._next
+        self.tasks[task_id] = type("Task", (), {"total": kwargs.get("total")})()
+        return task_id
+
+    def remove_task(self, task_id):
+        self.tasks.pop(task_id, None)
+
+    def update(self, *_args, **_kwargs):
+        return None
+
+    def reset(self, *_args, **_kwargs):
+        return None
+
+    def advance(self, *_args, **_kwargs):
+        return None
+
+
+def _ann_indexes(provider, *, wanted=None):
+    scalar = {"btree", "bitmap", "labellist", "fts", "inverted"}
+    found = []
+    for idx in provider._chunks_table.list_indices():
+        columns = list(idx.columns)
+        if "embedding" not in columns:
+            continue
+        token = str(idx.index_type).replace("_", "").lower()
+        if token in scalar:
+            continue
+        if wanted is not None and token != wanted:
+            continue
+        found.append(idx)
+    return found
+
+
+def test_finished_index_builds_vector_index_below_fragment_threshold(
+    tmp_path, monkeypatch
+):
+    """Compaction stays skipped, and the ANN index is still built at the end."""
+    monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
+    root, provider, coordinator, embedder = _provider(
+        tmp_path, threshold=100, index_type="ivf_hnsw_sq"
+    )
+    coordinator.progress = _Progress()
+    try:
+        for name in ("alpha.py", "beta.py"):
+            (root / name).write_text(
+                f"def {name[:-3]}_fn():\n    return '{name}'\n", encoding="utf-8"
+            )
+        result = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
+        assert result["status"] == "success", result
+        assert result["pipeline"] == "rust"
+        assert result["compaction_ran"] is False, result
+        fragments = provider._fragment_count(provider._chunks_table)
+        assert 0 < fragments < 100, fragments
+        indexes = _ann_indexes(provider, wanted="ivfhnswsq")
+        assert indexes, list(provider._chunks_table.list_indices())
+        stats = provider._chunks_table.index_stats(indexes[0].name)
+        assert stats is not None and stats.num_indexed_rows > 0, stats
+        assert str(stats.index_type).replace("_", "").lower() == "ivfhnswsq"
+        vector = asyncio.run(embedder.embed_single("alpha_fn"))
+        plan = (
+            provider._chunks_table.search(vector, vector_column_name="embedding")
+            .limit(5)
+            .explain_plan(True)
+        )
+        assert "ANNIvfPartition" in plan or "ANNSubIndex" in plan, plan
+        rows, _ = provider.search_semantic(
+            vector, embedder.name, embedder.model, page_size=5
+        )
+        assert any(row.get("file_path") == "alpha.py" for row in rows), rows
+    finally:
+        provider.disconnect()
+
+
+def test_short_auto_index_does_not_fail_the_run(tmp_path, monkeypatch):
+    """auto on a table too small to train keeps the rows and the run."""
+    monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
+    root, provider, coordinator, _embedder = _provider(
+        tmp_path, threshold=100, index_type=None
+    )
+    try:
+        (root / "alpha.py").write_text(
+            "def alpha_fn():\n    return 'alpha'\n", encoding="utf-8"
+        )
+        result = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
+        assert result["status"] == "success", result
+        assert _ann_indexes(provider) == []
+    finally:
+        provider.disconnect()
+
+
+def test_failed_index_build_is_not_a_successful_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
+    root, provider, coordinator, _embedder = _provider(
+        tmp_path, threshold=100, index_type="ivf_hnsw_sq"
+    )
+    try:
+        (root / "alpha.py").write_text(
+            "def alpha_fn():\n    return 'alpha'\n", encoding="utf-8"
+        )
+        first = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
+        assert first["status"] == "success", first
+        assert _ann_indexes(provider, wanted="ivfhnswsq")
+
+        def _fail_create(self, *_args, **_kwargs):
+            raise RuntimeError("disk offline")
+
+        monkeypatch.setattr(type(provider._chunks_table), "create_index", _fail_create)
+        (root / "alpha.py").write_text(
+            "def alpha_fn():\n    return 'changed'\n", encoding="utf-8"
+        )
+        second = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
+        assert second["status"] == "error", second
+    finally:
+        provider.disconnect()
+
+
+def test_failed_write_restores_the_vector_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
+    root, provider, coordinator, _embedder = _provider(
+        tmp_path, threshold=100, index_type="ivf_hnsw_sq"
+    )
+    try:
+        (root / "alpha.py").write_text(
+            "def alpha_fn():\n    return 'alpha'\n", encoding="utf-8"
+        )
+        first = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
+        assert first["status"] == "success", first
+        assert _ann_indexes(provider, wanted="ivfhnswsq")
+
+        def _fail_deletes(_db_path, _payload):
+            raise RuntimeError("write failed")
+
+        monkeypatch.setattr(
+            "chunkhound.providers.database.lance_store.apply_deletes",
+            _fail_deletes,
+        )
+        (root / "beta.py").write_text(
+            "def beta_fn():\n    return 'beta'\n", encoding="utf-8"
+        )
+        second = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
+        assert second["status"] == "error", second
+        assert _ann_indexes(provider, wanted="ivfhnswsq")
+    finally:
+        provider.disconnect()
+
+
 def test_default_settings_build_an_ann_index_when_threshold_is_always(
     tmp_path, monkeypatch
 ):

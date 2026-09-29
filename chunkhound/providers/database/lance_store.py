@@ -12,6 +12,8 @@ import os
 import time
 from typing import Any
 
+from loguru import logger
+
 from chunkhound.providers.database.lancedb_provider import (
     get_chunks_schema,
     get_files_schema,
@@ -262,18 +264,51 @@ def chunk_fragment_count(db_path: str) -> str:
     return str(LanceDBProvider._fragment_count(db.open_table("chunks")))
 
 
-def optimize_database(db_path: str, payload: str) -> str:
-    """Compact Lance fragments and build the configured vector index.
-
-    Runs on the Rust store thread after writes, on a direct ``lancedb``
-    connection. It does not go through the provider executor.
-    """
-    from datetime import timedelta
-
+def _index_type_name(payload: str) -> str:
     spec = json.loads(payload or "{}")
     index_type = spec.get("index_type")
     if index_type in (None, "", "auto"):
-        index_type = "auto"
+        return "auto"
+    return str(index_type)
+
+
+def drop_vector_indexes(db_path: str) -> str:
+    """Drop embedding ANN indexes so later adds do not maintain them."""
+    db = _connect(db_path)
+    if "chunks" not in set(db.table_names()):
+        return "ok"
+    table = db.open_table("chunks")
+    scalar = {"btree", "bitmap", "labellist", "fts", "inverted"}
+    for idx in table.list_indices():
+        columns = list(getattr(idx, "columns", []) or [])
+        if "embedding" not in columns:
+            continue
+        token = str(getattr(idx, "index_type", "")).replace("_", "").lower()
+        if token in scalar:
+            continue
+        name = getattr(idx, "name", None)
+        if name:
+            table.drop_index(str(name))
+    return "ok"
+
+
+def ensure_vector_index(db_path: str, payload: str) -> str:
+    """Build the configured ANN index. Does not compact."""
+    db = _connect(db_path)
+    if "chunks" not in set(db.table_names()):
+        return "ok"
+    _ensure_vector_index(db.open_table("chunks"), _index_type_name(payload))
+    return "ok"
+
+
+def optimize_database(db_path: str, payload: str) -> str:
+    """Compact fragments, then build the configured vector index.
+
+    Runs on a direct ``lancedb`` connection, not the provider executor.
+    """
+    from datetime import timedelta
+
+    index_type = _index_type_name(payload)
     db = _connect(db_path)
     names = set(db.table_names())
     for name in ("chunks", "files"):
@@ -324,5 +359,11 @@ def _ensure_vector_index(table: Any, index_type: str) -> None:
                 index_type=lance_type,
                 metric="cosine",
             )
-    except Exception:
-        return
+    except Exception as exc:
+        # A short auto/IVF_PQ table cannot train. The pre-write drop already
+        # removed any previous ANN index, so this is visible, but it must not
+        # fail the run. Every other create error has to reach the store thread.
+        if "not enough rows" in str(exc).lower():
+            logger.warning("Lance vector index was not built: {}", exc)
+            return
+        raise
