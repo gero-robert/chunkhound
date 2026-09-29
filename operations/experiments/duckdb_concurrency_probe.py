@@ -66,8 +66,8 @@ def ensure_schema(conn: Any, dims: int) -> None:
             content_hash TEXT,
             indexed_time DOUBLE,
             language TEXT,
-            encoding TEXT,
-            line_count BIGINT
+            name TEXT,
+            extension TEXT
         )
         """
     )

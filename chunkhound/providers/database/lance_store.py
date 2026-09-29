@@ -16,6 +16,8 @@ from loguru import logger
 
 from chunkhound.providers.database.lancedb_provider import (
     ensure_chunk_byte_columns,
+    ensure_file_name_columns,
+    file_name_and_extension,
     get_chunks_schema,
     get_files_schema,
 )
@@ -128,6 +130,8 @@ def _add_rows(db: Any, name: str, rows: list[dict[str, Any]], schema: Any) -> An
         table = db.open_table(name)
     elif name == "chunks":
         ensure_chunk_byte_columns(table)
+    elif name == "files":
+        ensure_file_name_columns(table)
     if rows:
         table.add(pa.Table.from_pylist(rows, schema=schema))
     return table
@@ -170,6 +174,7 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _file_row(file: dict[str, Any], file_id: int) -> dict[str, Any]:
+    name, extension = file_name_and_extension(file.get("path") or "")
     return {
         "id": file_id,
         "path": file.get("path") or "",
@@ -178,9 +183,9 @@ def _file_row(file: dict[str, Any], file_id: int) -> dict[str, Any]:
         "content_hash": file.get("content_hash") or "",
         "indexed_time": time.time(),
         "language": file.get("language") or "",
-        "encoding": "utf-8",
-        "line_count": 0,
         "skip_reason": file.get("skip_reason"),
+        "name": name,
+        "extension": extension,
     }
 
 

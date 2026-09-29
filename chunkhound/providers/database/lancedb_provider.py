@@ -30,7 +30,12 @@ if TYPE_CHECKING:
 
 # PyArrow schemas - avoiding LanceModel to prevent enum issues
 def get_files_schema() -> pa.Schema:
-    """Get PyArrow schema for files table."""
+    """PyArrow schema for the files table.
+
+    ``name`` and ``extension`` match DuckDB. They are appended so adding them
+    to an older table, then dropping ``encoding`` and ``line_count``, lands
+    in the same order as a newly created table.
+    """
     return pa.schema(
         [
             ("id", pa.int64()),
@@ -40,11 +45,64 @@ def get_files_schema() -> pa.Schema:
             ("content_hash", pa.string()),
             ("indexed_time", pa.float64()),
             ("language", pa.string()),
-            ("encoding", pa.string()),
-            ("line_count", pa.int64()),
             ("skip_reason", pa.string()),
+            ("name", pa.string()),
+            ("extension", pa.string()),
         ]
     )
+
+
+def file_name_and_extension(path: str) -> tuple[str, str | None]:
+    """Filename and extension stored by DuckDB's Rust file writer.
+
+    ``src/a.py`` is name ``a.py`` and extension ``py``. ``Makefile`` and
+    ``.gitignore`` have a null extension.
+    """
+    normalized = path.replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1]
+    if not name:
+        name = path
+    dot = name.rfind(".")
+    if dot <= 0:
+        return name, None
+    return name, name[dot + 1 :]
+
+
+def ensure_file_name_columns(table: Any) -> None:
+    """Add name and extension, then drop encoding and line_count.
+
+    Older Lance file tables stored placeholder encoding and line_count values.
+    New columns are filled from the path once. A failure raises so a later
+    write does not leave the removed columns in place.
+    """
+    names = set(table.schema.names)
+    # Same cast as create_schema. The Rust writer does not open that path,
+    # and table.add rejects a row that contains skip_reason when the column
+    # is absent.
+    if "skip_reason" not in names:
+        table.add_columns({"skip_reason": "cast(null as string)"})
+        names.add("skip_reason")
+    missing = [column for column in ("name", "extension") if column not in names]
+    obsolete = [column for column in ("encoding", "line_count") if column in names]
+    if not missing and not obsolete:
+        return
+    if missing:
+        table.add_columns({column: "cast(null as string)" for column in missing})
+    _backfill_file_names(table, all_rows=bool(missing))
+    if obsolete:
+        table.drop_columns(obsolete)
+
+
+def _backfill_file_names(table: Any, *, all_rows: bool) -> None:
+    rows = table.to_lance().to_table(columns=["id", "path", "name"]).to_pylist()
+    updates: list[dict[str, Any]] = []
+    for row in rows:
+        if not all_rows and row.get("name") is not None:
+            continue
+        name, extension = file_name_and_extension(row.get("path") or "")
+        updates.append({"id": int(row["id"]), "name": name, "extension": extension})
+    if updates:
+        table.merge_insert("id").when_matched_update_all().execute(updates)
 
 
 def get_chunks_schema(embedding_dims: int | None = None) -> pa.Schema:
@@ -411,13 +469,24 @@ class LanceDBProvider(SerialDatabaseProvider):
         # Create files table if it doesn't exist
         try:
             self._files_table = conn.open_table("files")
-            # Migrate: add skip_reason column to existing tables
+            # Migrate: add skip_reason column to existing tables.
+            # Lance accepts "string" here; "varchar" is rejected.
             if "skip_reason" not in self._files_table.schema.names:
                 try:
-                    self._files_table.add_columns({"skip_reason": "cast(null as varchar)"})
+                    self._files_table.add_columns(
+                        {"skip_reason": "cast(null as string)"}
+                    )
                     logger.info("Migrated files table: added skip_reason column")
                 except Exception as e:
-                    logger.warning(f"Could not add skip_reason column to files table: {e}")
+                    logger.warning(
+                        f"Could not add skip_reason column to files table: {e}"
+                    )
+            try:
+                ensure_file_name_columns(self._files_table)
+            except Exception as e:
+                logger.warning(
+                    f"Could not update file name columns on files table: {e}"
+                )
         except Exception:
             # Table doesn't exist, create it
             # Create table using PyArrow schema
@@ -682,11 +751,21 @@ class LanceDBProvider(SerialDatabaseProvider):
         """Executor method for insert_file - runs in DB thread."""
         if not self._files_table:
             self._executor_create_schema(conn, state)
+        ensure_file_name_columns(self._files_table)
 
         # Store path as-is (now relative with forward slashes from IndexingCoordinator)
         normalized_path = file.path
+        path_literal = _sql_literal(normalized_path)
+        existing = (
+            self._files_table.search()
+            .where(f"path = '{path_literal}'")
+            .limit(1)
+            .to_list()
+        )
 
-        # Prepare file data
+        # Prepare file data. Name and extension are set only when inserting,
+        # matching DuckDB: an update of an existing id leaves them unchanged.
+        # Python stores File.extension, which includes the leading dot.
         file_data = {
             "id": file.id or int(time.time() * 1000000),
             "path": normalized_path,
@@ -699,13 +778,14 @@ class LanceDBProvider(SerialDatabaseProvider):
                 if hasattr(file.language, "value")
                 else file.language
             ),
-            "encoding": "utf-8",
-            "line_count": 0,
             # Explicitly clear skip_reason so re-indexing a previously-skipped file
             # doesn't leave stale skip_reason in the row (when_matched_update_all only
             # updates columns present in the source dict).
             "skip_reason": None,
         }
+        if not existing or existing[0].get("name") is None:
+            file_data["name"] = file.name
+            file_data["extension"] = file.extension
 
         # Use merge_insert for atomic upsert based on path
         # This eliminates the TOCTOU race condition by making the
@@ -717,7 +797,9 @@ class LanceDBProvider(SerialDatabaseProvider):
         # Get the file ID (either newly inserted or existing)
         # We need to query back because merge_insert doesn't return the ID
         result = (
-            self._files_table.search().where(f"path = '{normalized_path}'").to_list()
+            self._files_table.search()
+            .where(f"path = '{path_literal}'")
+            .to_list()
         )
         if result:
             return result[0]["id"]
@@ -803,7 +885,7 @@ class LanceDBProvider(SerialDatabaseProvider):
             normalized_path = normalize_path_for_lookup(path, base_dir)
             results = (
                 self._files_table.search()
-                .where(f"path = '{normalized_path}'")
+                .where(f"path = '{_sql_literal(normalized_path)}'")
                 .to_list()
             )
             if not results:
@@ -881,6 +963,7 @@ class LanceDBProvider(SerialDatabaseProvider):
         """Executor method for update_file - runs in DB thread."""
         if not self._files_table:
             return
+        ensure_file_name_columns(self._files_table)
 
         try:
             # Get existing file record
@@ -942,15 +1025,28 @@ class LanceDBProvider(SerialDatabaseProvider):
         """Executor method for record_skipped_file - runs in DB thread."""
         if not self._files_table:
             self._executor_create_schema(conn, state)
+        ensure_file_name_columns(self._files_table)
 
         # Preserve existing id so chunks.file_id references are not orphaned
         # when a previously-indexed file transitions to skipped.
+        # A failed lookup is not proof the path is new. Leaving name and
+        # extension out of the update keeps an existing row's values.
+        lookup_failed = False
         try:
-            existing = self._files_table.search().where(f"path = '{path}'").limit(1).to_list()
+            existing = (
+                self._files_table.search()
+                .where(f"path = '{_sql_literal(path)}'")
+                .limit(1)
+                .to_list()
+            )
             file_id = existing[0]["id"] if existing else int(time.time() * 1000000)
         except Exception:
+            lookup_failed = True
+            existing = []
             file_id = int(time.time() * 1000000)
 
+        # Store the caller's name and extension on insert. DuckDB's conflict
+        # update does not refresh them, so an existing row keeps its values.
         file_data = {
             "id": file_id,
             "path": path,
@@ -959,10 +1055,11 @@ class LanceDBProvider(SerialDatabaseProvider):
             "content_hash": content_hash or "",
             "indexed_time": time.time(),
             "language": language or "",
-            "encoding": "utf-8",
-            "line_count": 0,
             "skip_reason": skip_reason,
         }
+        if not lookup_failed and (not existing or existing[0].get("name") is None):
+            file_data["name"] = name
+            file_data["extension"] = extension
 
         self._files_table.merge_insert(
             "path"

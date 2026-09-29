@@ -50,6 +50,22 @@ def connect(db_dir: Path):
     return lancedb.connect(str(db_dir))
 
 
+def _align_files_table(files: Any) -> None:
+    """Drop encoding/line_count and add name/extension on an older probe DB.
+
+    The files layout is copied from ChunkHound's Lance schema. Re-seeding a
+    directory created before that change fails if these columns still differ.
+    """
+    names = set(files.schema.names)
+    missing = [column for column in ("name", "extension") if column not in names]
+    if missing:
+        files.add_columns({column: "cast(null as string)" for column in missing})
+        names = set(files.schema.names)
+    obsolete = [column for column in ("encoding", "line_count") if column in names]
+    if obsolete:
+        files.drop_columns(obsolete)
+
+
 def ensure_schema(conn: Any, dims: int) -> tuple[Any, Any]:
     """Open or create files/chunks tables with expected schema."""
     _, pa, _ = _import_lance()
@@ -64,8 +80,8 @@ def ensure_schema(conn: Any, dims: int) -> tuple[Any, Any]:
             ("content_hash", pa.string()),
             ("indexed_time", pa.float64()),
             ("language", pa.string()),
-            ("encoding", pa.string()),
-            ("line_count", pa.int64()),
+            ("name", pa.string()),
+            ("extension", pa.string()),
         ]
     )
 
@@ -92,6 +108,7 @@ def ensure_schema(conn: Any, dims: int) -> tuple[Any, Any]:
         files = conn.open_table("files")
     except Exception:
         files = conn.create_table("files", schema=files_schema)
+    _align_files_table(files)
 
     try:
         chunks = conn.open_table("chunks")
@@ -118,8 +135,8 @@ def seed_data(conn: Any, rows: int, dims: int, provider: str, model: str) -> lis
                 "content_hash": "",
                 "indexed_time": time.time(),
                 "language": "text",
-                "encoding": "utf-8",
-                "line_count": 0,
+                "name": f"file_{i}.txt",
+                "extension": "txt",
             }
         )
     if file_rows:

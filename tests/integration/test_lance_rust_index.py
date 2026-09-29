@@ -423,3 +423,234 @@ def test_embedding_update_keeps_byte_offsets(tmp_path):
         assert (loaded.start_byte, loaded.end_byte) == (11, 19)
     finally:
         provider.disconnect()
+
+
+def test_file_rows_store_duckdb_name_and_extension(tmp_path):
+    """Rust indexing stores the filename and extension DuckDB's Rust writer stores."""
+    import lancedb
+
+    from chunkhound.providers.database.lance_store import write_batch
+    from chunkhound.providers.database.lancedb_provider import get_files_schema
+
+    db_dir = tmp_path / "lancedb.lancedb"
+    payload = json.dumps(
+        {
+            "files": [
+                _bare_file("src/pkg/main.py"),
+                _bare_file("vendor/libfoo.tar.gz"),
+                _bare_file("Makefile"),
+                _bare_file(".gitignore"),
+            ],
+            "delete_paths": [],
+        }
+    )
+    write_batch(str(db_dir), payload)
+    table = lancedb.connect(str(db_dir)).open_table("files")
+    rows = {row["path"]: row for row in table.to_arrow().to_pylist()}
+    assert (rows["src/pkg/main.py"]["name"], rows["src/pkg/main.py"]["extension"]) == (
+        "main.py",
+        "py",
+    )
+    assert (
+        rows["vendor/libfoo.tar.gz"]["name"],
+        rows["vendor/libfoo.tar.gz"]["extension"],
+    ) == ("libfoo.tar.gz", "gz")
+    assert (rows["Makefile"]["name"], rows["Makefile"]["extension"]) == (
+        "Makefile",
+        None,
+    )
+    assert (rows[".gitignore"]["name"], rows[".gitignore"]["extension"]) == (
+        ".gitignore",
+        None,
+    )
+    assert list(table.schema.names) == list(get_files_schema().names)
+
+
+def test_existing_files_table_gains_name_and_drops_placeholders(tmp_path):
+    """A files table that still has encoding and line_count accepts a later write."""
+    import lancedb
+    import pyarrow as pa
+
+    from chunkhound.providers.database.lance_store import write_batch
+    from chunkhound.providers.database.lancedb_provider import get_files_schema
+
+    old_schema = pa.schema(
+        [
+            ("id", pa.int64()),
+            ("path", pa.string()),
+            ("size", pa.int64()),
+            ("modified_time", pa.float64()),
+            ("content_hash", pa.string()),
+            ("indexed_time", pa.float64()),
+            ("language", pa.string()),
+            ("encoding", pa.string()),
+            ("line_count", pa.int64()),
+            ("skip_reason", pa.string()),
+        ]
+    )
+    kept = [
+        {
+            "id": 7,
+            "path": "src/old.py",
+            "size": 12,
+            "modified_time": 1.5,
+            "content_hash": "abc",
+            "indexed_time": 2.0,
+            "language": "python",
+            "encoding": "utf-8",
+            "line_count": 0,
+            "skip_reason": None,
+        },
+        {
+            "id": 8,
+            "path": "Makefile",
+            "size": 3,
+            "modified_time": 1.5,
+            "content_hash": "def",
+            "indexed_time": 2.0,
+            "language": "",
+            "encoding": "utf-8",
+            "line_count": 0,
+            "skip_reason": None,
+        },
+    ]
+    db_dir = tmp_path / "lancedb.lancedb"
+    db = lancedb.connect(str(db_dir))
+    db.create_table("files", schema=old_schema)
+    db.open_table("files").add(pa.Table.from_pylist(kept, schema=old_schema))
+
+    write_batch(
+        str(db_dir),
+        json.dumps({"files": [_bare_file("src/new.py")], "delete_paths": []}),
+    )
+    table = lancedb.connect(str(db_dir)).open_table("files")
+    rows = {row["path"]: row for row in table.to_arrow().to_pylist()}
+    assert list(table.schema.names) == list(get_files_schema().names)
+    assert "encoding" not in table.schema.names
+    assert "line_count" not in table.schema.names
+    old = rows["src/old.py"]
+    assert (old["id"], old["size"], old["content_hash"]) == (7, 12, "abc")
+    assert (old["name"], old["extension"]) == ("old.py", "py")
+    assert (rows["Makefile"]["name"], rows["Makefile"]["extension"]) == (
+        "Makefile",
+        None,
+    )
+    assert (rows["src/new.py"]["name"], rows["src/new.py"]["extension"]) == (
+        "new.py",
+        "py",
+    )
+
+
+def test_python_file_insert_stores_duckdb_name_and_keeps_it(tmp_path):
+    """Python insert stores the dotted extension, and a later skip does not rename."""
+    from chunkhound.core.models import File
+    from chunkhound.core.types.common import Language
+    from chunkhound.providers.database.lancedb_provider import LanceDBProvider
+
+    provider = LanceDBProvider(tmp_path / "lancedb.lancedb", base_directory=tmp_path)
+    provider.connect()
+    try:
+        provider.insert_file(
+            File(
+                path="pkg/code.py",
+                mtime=1.0,
+                language=Language.PYTHON,
+                size_bytes=4,
+            )
+        )
+        row = provider.get_file_by_path("pkg/code.py")
+        assert row is not None
+        assert (row["name"], row["extension"]) == ("code.py", ".py")
+
+        provider.record_skipped_file(
+            "pkg/code.py",
+            "renamed.py",
+            ".txt",
+            4,
+            1.0,
+            "python",
+            None,
+            "skip",
+        )
+        again = provider.get_file_by_path("pkg/code.py")
+        assert again is not None
+        assert (again["name"], again["extension"]) == ("code.py", ".py")
+        assert again["skip_reason"] == "skip"
+
+        provider.record_skipped_file(
+            "Makefile",
+            "Makefile",
+            "",
+            1,
+            1.0,
+            None,
+            None,
+            "binary",
+        )
+        skipped = provider.get_file_by_path("Makefile")
+        assert skipped is not None
+        assert (skipped["name"], skipped["extension"]) == ("Makefile", "")
+    finally:
+        provider.disconnect()
+
+
+def test_quoted_path_keeps_its_own_name_and_extension(tmp_path):
+    """A quote in the path must not match another row or clear its name."""
+    from chunkhound.core.models import File
+    from chunkhound.core.types.common import Language
+    from chunkhound.providers.database.lance_store import write_batch
+    from chunkhound.providers.database.lancedb_provider import LanceDBProvider
+
+    db_dir = tmp_path / "lancedb.lancedb"
+    # Write the Rust-style row before the provider opens the directory.
+    write_batch(
+        str(db_dir),
+        json.dumps({"files": [_bare_file("it's.py")], "delete_paths": []}),
+    )
+    provider = LanceDBProvider(db_dir, base_directory=tmp_path)
+    provider.connect()
+    try:
+        stored = provider.get_file_by_path("it's.py")
+        assert stored is not None
+        assert (stored["name"], stored["extension"]) == ("it's.py", "py")
+
+        provider.insert_file(
+            File(
+                path="real.py",
+                mtime=1.0,
+                language=Language.PYTHON,
+                size_bytes=1,
+            )
+        )
+        quoted = "x' OR path = 'real.py"
+        provider.insert_file(
+            File(
+                path=quoted,
+                mtime=1.0,
+                language=Language.PYTHON,
+                size_bytes=2,
+            )
+        )
+        real = provider.get_file_by_path("real.py")
+        injected = provider.get_file_by_path(quoted)
+        assert real is not None and injected is not None
+        assert real["id"] != injected["id"]
+        assert (real["name"], real["extension"]) == ("real.py", ".py")
+        assert (injected["name"], injected["extension"]) == (quoted, ".py")
+
+        provider.record_skipped_file(
+            "it's.py",
+            "it's.py",
+            ".py",
+            1,
+            1.0,
+            "python",
+            None,
+            "skip",
+        )
+        after = provider.get_file_by_path("it's.py")
+        assert after is not None
+        assert (after["name"], after["extension"]) == ("it's.py", "py")
+        assert after["skip_reason"] == "skip"
+    finally:
+        provider.disconnect()
