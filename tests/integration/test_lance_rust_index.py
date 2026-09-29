@@ -218,3 +218,208 @@ def test_one_batch_of_file_rows_is_one_fragment_and_ids_are_not_reused(tmp_path)
     assert by_path == {"a.py": 1, "b.py": 2, "c.py": 3, "d.py": 4}
     assert len(rows) == 4
     assert LanceDBProvider._fragment_count(files) == 2
+
+
+def _offset_chunk(
+    symbol: str,
+    start_line: int,
+    end_line: int,
+    code: str,
+    start_byte: int | None,
+    end_byte: int | None,
+) -> dict:
+    return {
+        "chunk_type": "function",
+        "symbol": symbol,
+        "code": code,
+        "start_line": start_line,
+        "end_line": end_line,
+        "start_byte": start_byte,
+        "end_byte": end_byte,
+        "language": "python",
+        "metadata": None,
+        "embedding": None,
+        "provider": None,
+        "model": None,
+    }
+
+
+def _span(chunk) -> tuple:
+    return (
+        chunk.symbol,
+        int(chunk.start_line),
+        int(chunk.end_line),
+        chunk.code,
+        None if chunk.start_byte is None else int(chunk.start_byte),
+        None if chunk.end_byte is None else int(chunk.end_byte),
+    )
+
+
+def test_indexed_chunks_keep_parser_byte_offsets(tmp_path, monkeypatch):
+    """Rust indexing stores the same byte span the parser computed."""
+    from chunkhound.core.types.common import FileId, Language
+    from chunkhound.parsers.parser_factory import create_parser_for_language
+
+    monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
+    provider, coordinator, _db_dir, root = _coordinator(tmp_path)
+    source = "x = 1\n\ndef hello():\n    return 1\n"
+    file_path = root / "main.py"
+    file_path.write_text(source)
+    parsed = create_parser_for_language(Language.PYTHON).parse_file(
+        file_path, FileId(0)
+    )
+    assert any(chunk.start_byte is not None for chunk in parsed)
+    try:
+        result = asyncio.run(coordinator.process_directory(root, patterns=["**/*"]))
+        assert result["status"] == "success", result
+        file_record = provider.get_file_by_path("main.py")
+        assert file_record is not None
+        file_id = file_record["id"] if isinstance(file_record, dict) else file_record.id
+        stored = provider.get_chunks_by_file_id(file_id, as_model=True)
+        assert sorted(_span(chunk) for chunk in stored) == sorted(
+            _span(chunk) for chunk in parsed
+        )
+    finally:
+        provider.disconnect()
+
+
+def test_same_line_chunks_are_ordered_by_start_byte(tmp_path):
+    """A later chunk written first is still returned in start_byte order."""
+    from chunkhound.providers.database.lance_store import write_batch
+    from chunkhound.providers.database.lancedb_provider import LanceDBProvider
+
+    db_dir = tmp_path / "lancedb.lancedb"
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    **_bare_file("same.py"),
+                    "chunks": [
+                        _offset_chunk("later", 1, 1, "later", 30, 35),
+                        _offset_chunk("earlier", 1, 1, "earlier", 5, 12),
+                        _offset_chunk("third", 3, 3, "third", None, None),
+                    ],
+                }
+            ],
+            "delete_paths": [],
+        }
+    )
+    file_id = json.loads(write_batch(str(db_dir), payload))["file_ids"][0]
+    provider = LanceDBProvider(str(db_dir), base_directory=tmp_path)
+    provider.connect()
+    try:
+        chunks = provider.get_chunks_by_file_id(file_id, as_model=True)
+        assert [
+            (chunk.symbol, chunk.start_byte, chunk.end_byte) for chunk in chunks
+        ] == [
+            ("earlier", 5, 12),
+            ("later", 30, 35),
+            ("third", None, None),
+        ]
+        ranged = provider.get_chunks_in_range(file_id, 1, 1)
+        assert {
+            (row["symbol"], row["start_byte"], row["end_byte"]) for row in ranged
+        } == {
+            ("earlier", 5, 12),
+            ("later", 30, 35),
+        }
+        one = provider.get_chunk_by_id(chunks[0].id, as_model=True)
+        assert one is not None
+        assert (one.start_byte, one.end_byte) == (5, 12)
+    finally:
+        provider.disconnect()
+
+
+def test_existing_chunks_table_gains_byte_columns(tmp_path):
+    """A table created without byte columns accepts a later write."""
+    import lancedb
+    import pyarrow as pa
+
+    from chunkhound.providers.database.lance_store import write_batch
+    from chunkhound.providers.database.lancedb_provider import get_chunks_schema
+
+    old_schema = pa.schema(
+        [
+            field
+            for field in get_chunks_schema()
+            if field.name not in {"start_byte", "end_byte"}
+        ]
+    )
+    db_dir = tmp_path / "lancedb.lancedb"
+    db = lancedb.connect(str(db_dir))
+    kept = {
+        "id": 1,
+        "file_id": 7,
+        "content": "kept",
+        "start_line": 1,
+        "end_line": 1,
+        "chunk_type": "function",
+        "language": "python",
+        "name": "kept",
+        "embedding": None,
+        "provider": "",
+        "model": "",
+        "created_time": 1.0,
+        "metadata": "{}",
+    }
+    db.create_table("chunks", schema=old_schema)
+    db.open_table("chunks").add(pa.Table.from_pylist([kept], schema=old_schema))
+
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    **_bare_file("new.py"),
+                    "chunks": [_offset_chunk("added", 1, 1, "added", 4, 9)],
+                }
+            ],
+            "delete_paths": [],
+        }
+    )
+    write_batch(str(db_dir), payload)
+    table = lancedb.connect(str(db_dir)).open_table("chunks")
+    rows = {row["name"]: row for row in table.to_arrow().to_pylist()}
+    assert rows["kept"]["start_byte"] is None
+    assert rows["kept"]["end_byte"] is None
+    assert rows["kept"]["content"] == "kept"
+    assert (rows["added"]["start_byte"], rows["added"]["end_byte"]) == (4, 9)
+
+
+def test_embedding_update_keeps_byte_offsets(tmp_path):
+    """Rewriting a chunk to store its vector keeps the byte span."""
+    from chunkhound.core.models import Chunk
+    from chunkhound.core.types.common import ChunkType, Language
+    from chunkhound.providers.database.lancedb_provider import LanceDBProvider
+
+    provider = LanceDBProvider(tmp_path / "lancedb.lancedb", base_directory=tmp_path)
+    provider.connect()
+    try:
+        chunk_id = provider.insert_chunk(
+            Chunk(
+                symbol="hello",
+                start_line=2,
+                end_line=3,
+                code="return 1",
+                chunk_type=ChunkType.FUNCTION,
+                file_id=1,
+                language=Language.PYTHON,
+                start_byte=11,
+                end_byte=19,
+            )
+        )
+        updated = provider.insert_embeddings_batch(
+            [
+                {
+                    "chunk_id": chunk_id,
+                    "embedding": [0.1] * 8,
+                    "provider": "fake",
+                    "model": "fake-embeddings",
+                }
+            ]
+        )
+        assert updated == 1
+        loaded = provider.get_chunk_by_id(chunk_id, as_model=True)
+        assert loaded is not None
+        assert (loaded.start_byte, loaded.end_byte) == (11, 19)
+    finally:
+        provider.disconnect()

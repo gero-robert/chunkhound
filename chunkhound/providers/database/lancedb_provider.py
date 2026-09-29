@@ -78,8 +78,41 @@ def get_chunks_schema(embedding_dims: int | None = None) -> pa.Schema:
                 "metadata",
                 pa.string(),
             ),  # JSON-serialized chunk metadata (constants, etc.)
+            # Appended so add_columns on an older table lands in the same place.
+            ("start_byte", pa.int64()),
+            ("end_byte", pa.int64()),
         ]
     )
+
+
+def stored_byte(value: Any) -> int | None:
+    """Integer byte offset, or None when the stored value is null."""
+    if value is None:
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def ensure_chunk_byte_columns(table: Any) -> None:
+    """Add nullable byte columns on a chunks table created before them."""
+    names = set(table.schema.names)
+    missing = [name for name in ("start_byte", "end_byte") if name not in names]
+    if not missing:
+        return
+    table.add_columns({name: "cast(null as bigint)" for name in missing})
+
+
+def _chunk_file_order(row: dict[str, Any]) -> tuple[int, int]:
+    """Match DuckDB ``ORDER BY start_line, start_byte`` (null offsets last)."""
+    start_line = row.get("start_line")
+    start_byte = stored_byte(row.get("start_byte"))
+    line = int(start_line) if start_line is not None else 0
+    offset = start_byte if start_byte is not None else 2**63 - 1
+    return (line, offset)
 
 
 def _has_valid_embedding(x: Any) -> bool:
@@ -394,6 +427,12 @@ class LanceDBProvider(SerialDatabaseProvider):
         # Create chunks table if it doesn't exist
         try:
             self._chunks_table = conn.open_table("chunks")
+            try:
+                ensure_chunk_byte_columns(self._chunks_table)
+            except Exception as e:
+                logger.warning(
+                    f"Could not add byte offset columns to chunks table: {e}"
+                )
             logger.debug("Opened existing chunks table")
         except Exception:
             # Table doesn't exist, create it
@@ -992,6 +1031,8 @@ class LanceDBProvider(SerialDatabaseProvider):
             "model": "",
             "created_time": time.time(),
             "metadata": _serialize_metadata(chunk.metadata),
+            "start_byte": stored_byte(chunk.start_byte),
+            "end_byte": stored_byte(chunk.end_byte),
         }
 
         # Use PyArrow Table directly to avoid LanceDB DataFrame schema alignment bug
@@ -1060,6 +1101,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                     "model": "",
                     "created_time": time.time(),
                     "metadata": _serialize_metadata(chunk.metadata),
+                    "start_byte": stored_byte(chunk.start_byte),
+                    "end_byte": stored_byte(chunk.end_byte),
                 }
                 chunk_data_list.append(chunk_data)
 
@@ -1114,6 +1157,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                     chunk_type=ChunkType(result["chunk_type"]),
                     language=Language(result["language"]),
                     symbol=result["name"],
+                    start_byte=stored_byte(result.get("start_byte")),
+                    end_byte=stored_byte(result.get("end_byte")),
                     metadata=_deserialize_metadata(result.get("metadata")),
                 )
             return result
@@ -1142,6 +1187,7 @@ class LanceDBProvider(SerialDatabaseProvider):
             )
             # Deduplicate across fragments
             results = _deduplicate_by_id(results)
+            results.sort(key=_chunk_file_order)
 
             if as_model:
                 return [
@@ -1154,6 +1200,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                         chunk_type=ChunkType(result["chunk_type"]),
                         language=Language(result["language"]),
                         symbol=result["name"],
+                        start_byte=stored_byte(result.get("start_byte")),
+                        end_byte=stored_byte(result.get("end_byte")),
                         metadata=_deserialize_metadata(result.get("metadata")),
                     )
                     for result in results
@@ -1225,8 +1273,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                     "code": result.get("content", ""),
                     "start_line": result.get("start_line", 0),
                     "end_line": result.get("end_line", 0),
-                    "start_byte": None,  # LanceDB chunks table doesn't store byte offsets
-                    "end_byte": None,
+                    "start_byte": stored_byte(result.get("start_byte")),
+                    "end_byte": stored_byte(result.get("end_byte")),
                     "language": result.get("language", ""),
                     "metadata": _deserialize_metadata(result.get("metadata")),
                     "created_at": result.get("created_time"),
@@ -1382,6 +1430,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                             "metadata": _serialize_metadata(
                                 _deserialize_metadata(row.get("metadata"))
                             ),  # Serialize existing metadata
+                            "start_byte": stored_byte(row.get("start_byte")),
+                            "end_byte": stored_byte(row.get("end_byte")),
                         }
                         chunks_to_restore.append(chunk_data)
 
@@ -1535,6 +1585,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                                 "metadata": _serialize_metadata(
                                     _deserialize_metadata(row.get("metadata"))
                                 ),  # Serialize metadata
+                                "start_byte": stored_byte(row.get("start_byte")),
+                                "end_byte": stored_byte(row.get("end_byte")),
                             }
                         )
 

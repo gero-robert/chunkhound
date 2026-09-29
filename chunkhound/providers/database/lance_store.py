@@ -15,6 +15,7 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.providers.database.lancedb_provider import (
+    ensure_chunk_byte_columns,
     get_chunks_schema,
     get_files_schema,
 )
@@ -125,6 +126,8 @@ def _add_rows(db: Any, name: str, rows: list[dict[str, Any]], schema: Any) -> An
         # create_table makes lancedb infer a list size and raise.
         db.create_table(name, schema=schema)
         table = db.open_table(name)
+    elif name == "chunks":
+        ensure_chunk_byte_columns(table)
     if rows:
         table.add(pa.Table.from_pylist(rows, schema=schema))
     return table
@@ -158,6 +161,12 @@ def apply_deletes(directory: str, payload: str) -> str:
         _delete_where(files, f"id = {file_id}")
         removed += 1
     return json.dumps({"removed": removed})
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def _file_row(file: dict[str, Any], file_id: int) -> dict[str, Any]:
@@ -239,6 +248,8 @@ def write_batch(directory: str, payload: str) -> str:
                     "model": chunk.get("model") or "",
                     "created_time": time.time(),
                     "metadata": chunk.get("metadata"),
+                    "start_byte": _optional_int(chunk.get("start_byte")),
+                    "end_byte": _optional_int(chunk.get("end_byte")),
                 }
             )
     if file_rows:
