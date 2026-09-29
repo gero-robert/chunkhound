@@ -9,7 +9,14 @@ import xxhash
 from chunkhound.utils.normalization import normalize_content
 
 
-def generate_chunk_id(file_id: int, content: str, concept: str | None = None) -> int:
+def generate_chunk_id(
+    file_id: int,
+    content: str,
+    concept: str | None = None,
+    *,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> int:
     """Generate deterministic 64-bit chunk ID from file, content, and concept.
 
     Uses xxHash3-64 for fast, collision-resistant hashing. Hash includes file_id
@@ -66,6 +73,11 @@ def generate_chunk_id(file_id: int, content: str, concept: str | None = None) ->
     # This ensures identical content with different semantic meanings gets different IDs
     if concept is not None:
         h.update(concept.encode("utf-8"))
+
+    # Identical text at two spans in one file must not share an id. Lance uses
+    # this id as the row identity, so a content-only hash collapses both rows.
+    if start_line is not None and end_line is not None:
+        h.update(f"\0{start_line}:{end_line}".encode())
 
     # Get unsigned 64-bit hash
     unsigned_hash = h.intdigest()

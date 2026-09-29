@@ -20,6 +20,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[pyfunction]
+fn write_lance_format_probe(py: Python<'_>, directory: String) -> PyResult<()> {
+    // The lance crate that matches installed pylance 0.38.1 needs protoc to
+    // build. The store path calls the installed lancedb package instead.
+    let module = py.import_bound("chunkhound.providers.database.lance_store")?;
+    module.call_method1("write_format_probe", (directory,))?;
+    Ok(())
+}
+
+#[pyfunction]
 #[pyo3(signature = (root, extensions, skip_dirs=None, exclude_patterns=None, exact_names=None, include_all=false))]
 fn scan_files(
     py: Python<'_>,
@@ -469,6 +478,7 @@ fn chunkhound_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init();
 
     m.add_function(wrap_pyfunction!(scan_files, m)?)?;
+    m.add_function(wrap_pyfunction!(write_lance_format_probe, m)?)?;
 
     m.add_class::<pipeline::IndexingPipeline>()?;
     m.add_class::<pipeline::PipelineReport>()?;

@@ -178,6 +178,8 @@ mod test_support {
             compaction_threshold: Some(0.30),
             compaction_min_size_bytes: 52_428_800,
             insert_batch_size: 100,
+            lance_optimize_fragment_threshold: 0,
+            lance_index_type: String::new(),
         }
     }
 

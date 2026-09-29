@@ -29,6 +29,21 @@ from chunkhound.pipeline_bridge import run_rust_pipeline
 from chunkhound.services.progress_utils import _update_speed_field, format_bytes
 
 
+def rust_storage_target(db: DatabaseProvider) -> tuple[Path, str]:
+    """Path and backend kind handed to the Rust pipeline.
+
+    DuckDB's ``db_path`` is the ``chunks.db`` file. Rust receives its parent
+    directory and appends ``chunks.db``.
+
+    LanceDB's ``db_path`` is the ``.lancedb`` directory. Rust receives that
+    directory and does not append ``chunks.db``.
+    """
+    raw = Path(str(db.db_path))
+    if raw.suffix == ".lancedb":
+        return raw, "lancedb"
+    return raw.parent, "duckdb"
+
+
 class RustProgressBridge:
     """Bridges the Rust pipeline's `progress_callback(phase, current, total,
     chunks=0)` calls to Rich progress bars, and exposes the handful of
@@ -206,9 +221,7 @@ class RustProgressBridge:
                 info="done",
             )
             _pr.reset(self._index_task, start=True)
-            _pr.update(
-                self._index_task, completed=1, info="included in compaction"
-            )
+            _pr.update(self._index_task, completed=1, info="included in compaction")
             _pr.reset(self._compact_task, start=True)
             _pr.update(
                 self._compact_task, info="compacting (includes index rebuild)..."
@@ -237,9 +250,7 @@ class RustProgressBridge:
             if self.compact_ran:
                 if self.compact_size_before is not None:
                     try:
-                        self.compact_size_after = os.path.getsize(
-                            self._compact_db_file
-                        )
+                        self.compact_size_after = os.path.getsize(self._compact_db_file)
                         pct = (
                             (self.compact_size_before - self.compact_size_after)
                             / self.compact_size_before
@@ -258,9 +269,7 @@ class RustProgressBridge:
                         self._compact_info = "done"
                 else:
                     self._compact_info = "done"
-                _pr.update(
-                    self._compact_task, completed=1, info=self._compact_info
-                )
+                _pr.update(self._compact_task, completed=1, info=self._compact_info)
             else:
                 # write-index path: the compact bar was already resolved
                 # to "not needed" above; only the index bar (still running
@@ -323,7 +332,7 @@ async def run_rust_indexing_phase(
     DiskUsageLimitExceededError, etc.) propagate uncaught — the caller's own
     exception handling is unchanged by this extraction.
     """
-    db_path = Path(str(db.db_path)).parent
+    db_path, backend = rust_storage_target(db)
     embeddings_disabled_by_config = (
         config.embeddings_disabled
         if config and hasattr(config, "embeddings_disabled")
@@ -453,12 +462,22 @@ async def run_rust_indexing_phase(
         rust_stats = await run_rust_pipeline(
             files_to_process,
             db_path=db_path,
+            backend=backend,
+            embedding_provider_obj=embedding_provider,
             project_root=directory,
             force_reindex=force_reindex,
             skip_embeddings=skip_embeddings,
             do_cleanup=do_cleanup,
             config=config,
             progress_callback=progress_cb,
+            lance_optimize_fragment_threshold=int(
+                getattr(db, "_fragment_threshold", 0) or 0
+            ),
+            lance_index_type=(
+                "auto"
+                if getattr(db, "index_type", None) in (None, "", "auto")
+                else str(db.index_type)
+            ),
         )
     finally:
         # Reopen the Python-side DuckDB connection whether or not

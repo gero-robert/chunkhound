@@ -147,9 +147,10 @@ impl IndexingPipeline {
             // below — files removed from disk since the last run (down to
             // zero) need their orphaned DB rows deleted. The store thread
             // applies `delete_paths` once at start, before the insert loop.
-            let no_db_yet = (self.config.db_path.as_os_str().is_empty()
-                || self.config.db_path.as_os_str() == ":memory:")
-                || !self.config.db_path.join("chunks.db").exists();
+            let storage = self.config.storage_path();
+            let no_db_yet = storage.as_os_str().is_empty()
+                || storage.as_os_str() == ":memory:"
+                || !storage.exists();
             if no_db_yet {
                 return Ok(PipelineReport::empty());
             }
@@ -218,20 +219,16 @@ impl IndexingPipeline {
             disk_stats = diff.disk_stats;
         }
 
-        // ── Resolve directory→db file path (shared by both write paths) ──
-        let db_file: PathBuf = if self.config.db_path.as_os_str().is_empty()
-            || self.config.db_path.as_os_str() == ":memory:"
-        {
-            PathBuf::from(":memory:")
-        } else {
-            self.config.db_path.join("chunks.db")
-        };
+        // DuckDB appends chunks.db; LanceDB keeps the .lancedb directory.
+        let db_file = self.config.storage_path();
 
         let db_config = DbConfig {
             db_path: db_file.to_string_lossy().into_owned(),
             compaction_threshold: self.config.compaction_threshold,
             compaction_min_size_bytes: self.config.compaction_min_size_mb * 1024 * 1024,
             insert_batch_size: self.config.db_batch_size.max(1),
+            lance_optimize_fragment_threshold: self.config.lance_optimize_fragment_threshold,
+            lance_index_type: self.config.lance_index_type.clone(),
         };
 
         // Ensure parent directory exists (DuckDB doesn't auto-create it).
@@ -352,18 +349,15 @@ impl IndexingPipeline {
         let total_files = files.len() as u64;
         emit_progress(py, progress_callback, "diff", 0, total_files);
 
-        let db_file = if self.config.db_path.as_os_str().is_empty()
-            || self.config.db_path.as_os_str() == ":memory:"
-        {
+        let db_file = self.config.storage_path();
+        if db_file.as_os_str().is_empty() || db_file.as_os_str() == ":memory:" {
             emit_progress(py, progress_callback, "diff", total_files, total_files);
             return Ok(DiffResult {
                 changed: files.to_vec(),
                 removed: Vec::new(),
                 ..Default::default()
             });
-        } else {
-            self.config.db_path.join("chunks.db")
-        };
+        }
 
         // Deliberately NOT short-circuited on `!db_file.exists()` here: a
         // crashed compaction swap (compaction.rs's 3-phase protocol) renames
@@ -393,6 +387,8 @@ impl IndexingPipeline {
                 compaction_threshold,
                 compaction_min_size_bytes,
                 insert_batch_size,
+                lance_optimize_fragment_threshold: 0,
+                lance_index_type: String::new(),
             };
             let backend: Box<dyn DbBackend> = create_backend(db_config);
             let db_entries: Vec<DbFileEntry> = backend.read_file_states()?;
@@ -1577,7 +1573,7 @@ impl IndexingPipeline {
                 start_byte: Self::opt_i64_from_dict(py, cd, "start_byte"),
                 end_byte: Self::opt_i64_from_dict(py, cd, "end_byte"),
                 language: Self::opt_str_from_dict(py, cd, "language"),
-                metadata: Self::opt_str_from_dict(py, cd, "metadata"),
+                metadata: Self::metadata_from_dict(py, cd),
                 embed_text: Self::opt_str_from_dict(py, cd, "embed_text"),
                 embedding: None,
                 provider: None,
@@ -1594,6 +1590,23 @@ impl IndexingPipeline {
             .flatten()
             .and_then(|v| v.extract::<String>().ok())
             .unwrap_or_default()
+    }
+
+    /// Chunk.to_dict() puts metadata on the dict as a mapping. Store it as JSON
+    /// so Lance and DuckDB readers deserialize the same object.
+    fn metadata_from_dict(py: Python<'_>, dict: &Bound<'_, PyDict>) -> Option<String> {
+        let value = dict.get_item("metadata").ok().flatten()?;
+        if value.is_none() {
+            return None;
+        }
+        if let Ok(text) = value.extract::<String>() {
+            return Some(text);
+        }
+        let json = py.import_bound("json").ok()?;
+        json.call_method1("dumps", (value,))
+            .ok()?
+            .extract::<String>()
+            .ok()
     }
 
     fn opt_str_from_dict(_py: Python<'_>, dict: &Bound<'_, PyDict>, key: &str) -> Option<String> {

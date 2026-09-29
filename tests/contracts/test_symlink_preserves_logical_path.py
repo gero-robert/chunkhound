@@ -36,7 +36,14 @@ class TestSymlinkPreservesLogicalPath:
         target = project_root / "real_module.py"
         target.write_text("def real():\n    return 1\n")
         link = project_root / "linked_module.py"
-        link.symlink_to(target)
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip(
+                    "SeCreateSymbolicLinkPrivilege is not assigned to this process"
+                )
+            raise
 
         db_dir = tmp_path / "db"
         db_dir.mkdir()
@@ -50,7 +57,9 @@ class TestSymlinkPreservesLogicalPath:
             force_reindex=True,
             skip_embeddings=True,
         )
-        assert not first["errors"], f"Unexpected errors on first index: {first['errors']}"
+        assert not first["errors"], (
+            f"Unexpected errors on first index: {first['errors']}"
+        )
         assert first["total_files"] == 2
 
         before_counts = collect_table_counts(db_dir)
@@ -70,7 +79,9 @@ class TestSymlinkPreservesLogicalPath:
             force_reindex=False,
             skip_embeddings=True,
         )
-        assert not second["errors"], f"Unexpected errors on incremental re-index: {second['errors']}"
+        assert not second["errors"], (
+            f"Unexpected errors on incremental re-index: {second['errors']}"
+        )
         assert second["total_files"] == 0, (
             "nothing changed on disk — an incremental run must not reprocess "
             "either file"

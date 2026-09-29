@@ -214,8 +214,7 @@ async def run_batch_compaction_boundary(
     if status == "skipped":
         return
     raise RuntimeError(
-        "Batch database compaction failed: "
-        f"{compaction.get('error', compaction)}"
+        f"Batch database compaction failed: {compaction.get('error', compaction)}"
     )
 
 
@@ -1278,10 +1277,15 @@ class IndexingCoordinator(BaseService):
             # Test DB fakes may not expose db_path — fall through to Python
             # before the cleanup gate fires so orphan cleanup isn't skipped.
             return False
-        if Path(str(self._db.db_path)).name != "chunks.db":
-            # Rust pipeline hardcodes appending "chunks.db" to the directory
-            # it receives, so it can only write to a file named chunks.db.
-            # Fall back to Python for any other DB filename.
+        from chunkhound.services.rust_pipeline_runner import rust_storage_target
+
+        _, storage_kind = rust_storage_target(self._db)
+        if (
+            storage_kind != "lancedb"
+            and Path(str(self._db.db_path)).name != "chunks.db"
+        ):
+            # DuckDB Rust opens the parent directory and appends chunks.db.
+            # A provider pointed at any other filename would write a different file.
             if log_reason:
                 logger.info(
                     "Rust pipeline skipped — db_path '{}' is not named chunks.db; "

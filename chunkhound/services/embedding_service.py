@@ -762,7 +762,7 @@ class EmbeddingService(BaseService):
                     text,
                     self._embedding_provider.name,
                     self._embedding_provider.model,
-                    base_url=self._embedding_provider.base_url,
+                    base_url=getattr(self._embedding_provider, "base_url", None),
                 )
             else:
                 # Fallback for no provider (conservative default)
@@ -806,6 +806,10 @@ class EmbeddingService(BaseService):
         self, provider: str, model: str, exclude_patterns: list[str] | None = None
     ) -> list[ChunkId]:
         """Get just the IDs of chunks that don't have embeddings (provider-agnostic)."""
+        paged = getattr(self._db, "list_chunk_ids_without_embeddings", None)
+        if callable(paged):
+            return [ChunkId(int(chunk_id)) for chunk_id in paged(provider, model)]
+
         # Get all chunks with metadata using provider-agnostic method
         all_chunks = self._db.get_all_chunks_with_metadata()
 
@@ -907,6 +911,19 @@ class EmbeddingService(BaseService):
         """Get chunk data for specific chunk IDs."""
         if not chunk_ids:
             return []
+
+        direct = getattr(self._db, "get_chunks_by_ids", None)
+        if callable(direct):
+            rows = direct([int(chunk_id) for chunk_id in chunk_ids])
+            return [
+                {
+                    "id": int(row["id"]),
+                    "code": row.get("content", row.get("code", "")) or "",
+                    "symbol": row.get("name", row.get("symbol", "")) or "",
+                    "path": row.get("file_path", row.get("path", "")) or "",
+                }
+                for row in rows
+            ]
 
         # Use provider-agnostic method to get all chunks with metadata
         all_chunks_data = self._db.get_all_chunks_with_metadata()

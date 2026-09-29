@@ -1,4 +1,4 @@
-"""Regression test: CHUNKHOUND_USE_RUST=1 must not break non-DuckDB providers.
+"""CHUNKHOUND_USE_RUST=1 indexes a LanceDB project through the Rust pipeline.
 
 `chunkhound_native.IndexingPipeline` only implements a DuckDB backend
 (`DuckDbHnswBackend`). Before this fix, `IndexingCoordinator.process_directory()`
@@ -34,20 +34,21 @@ def coordinator(lancedb_provider, tmp_path):
     )
 
 
-def test_rust_flag_falls_back_to_python_for_lancedb(coordinator, tmp_path, monkeypatch):
-    """CHUNKHOUND_USE_RUST=1 against a LanceDB project must fall back to the
-    Python path — not disconnect the provider and hand it to the DuckDB-only
-    Rust pipeline.
+def test_rust_flag_indexes_lancedb_through_the_rust_pipeline(
+    coordinator, tmp_path, monkeypatch
+):
+    """CHUNKHOUND_USE_RUST=1 against LanceDB writes through the Rust pipeline.
+
+    The provider stays queryable afterward, which is the reconnect contract.
     """
     monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
 
     (tmp_path / "main.py").write_text("def hello():\n    return 1\n")
 
-    result = asyncio.run(
-        coordinator.process_directory(tmp_path, patterns=["**/*.py"])
-    )
+    result = asyncio.run(coordinator.process_directory(tmp_path, patterns=["**/*.py"]))
 
-    assert result["status"] == "success"
+    assert result["status"] == "success", result
+    assert result["pipeline"] == "rust"
     assert result["files_processed"] >= 1
     assert result["total_chunks"] >= 1
 

@@ -61,6 +61,7 @@ except ImportError as e:
     ) from e
 
 scan_files = _native_module.scan_files
+write_lance_format_probe = _native_module.write_lance_format_probe
 IndexingPipeline = _native_module.IndexingPipeline
 PipelineReport = _native_module.PipelineReport
 ParseCallConfig = _native_module.ParseCallConfig

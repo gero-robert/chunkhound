@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     from chunkhound.interfaces.embedding_provider import EmbeddingProvider
 
+
 @dataclass
 class _EmbedThreadCache:
     """Per-``run_rust_pipeline()`` cache of embed providers/event loops.
@@ -98,9 +99,7 @@ def _shutdown_embed_thread_resources(cache: "_EmbedThreadCache") -> None:
                 tid,
             )
         except Exception as e:
-            logger.debug(
-                "Embedding provider shutdown failed for thread {}: {}", tid, e
-            )
+            logger.debug("Embedding provider shutdown failed for thread {}: {}", tid, e)
         if not loop.is_closed():
             loop.close()
 
@@ -252,13 +251,29 @@ def parse_file_callback(
         ):
             return ("", [], "large_config_file")
 
-    parser = create_parser_for_language(
-        lang, detect_embedded_sql=detect_embedded_sql
-    )
+    parser = create_parser_for_language(lang, detect_embedded_sql=detect_embedded_sql)
 
     file_id = FileId(0)  # Rust assigns the real ID
     chunks = parser.parse_file(Path(file_path), file_id)
     return (lang.value, [c.to_dict() for c in chunks], None)
+
+
+def _embed_provider_instance(texts: list[str], *, provider: Any) -> list[list[float]]:
+    """Embed with the coordinator's provider instance.
+
+    Non-native providers (anything other than the OpenAI and Voyage adapters
+    built inside Rust) are the object ``process_directory`` was given. The
+    config-built callback cannot reconstruct that instance.
+    """
+    import asyncio
+
+    async def _run() -> list[list[float]]:
+        result = await provider.embed(texts)
+        if hasattr(result, "embeddings"):
+            return list(result.embeddings)
+        return list(result)
+
+    return asyncio.run(_run())
 
 
 def embed_batch_callback(
@@ -656,7 +671,6 @@ def _resolved_embedding_model(embedding_cfg: Any, provider: str) -> str:
     }.get(provider, "")
 
 
-
 _T = TypeVar("_T")
 _MISSING = object()
 
@@ -680,11 +694,15 @@ async def run_rust_pipeline(
     *,
     db_path: Path,
     project_root: Path,
+    backend: str = "duckdb",
     force_reindex: bool = False,
     skip_embeddings: bool = False,
     do_cleanup: bool = True,
+    embedding_provider_obj: Any = None,
     config: Any = None,
     progress_callback: Any = None,
+    lance_optimize_fragment_threshold: int = 0,
+    lance_index_type: str = "",
 ) -> dict[str, Any]:
     """Run the Rust indexing pipeline and return coordinator-compatible stats.
 
@@ -695,8 +713,10 @@ async def run_rust_pipeline(
 
     Args:
         files_to_process: List of (path, content_hash) tuples from change detection.
-        db_path: Parent directory containing ``chunks.db``.
+        db_path: DuckDB parent directory (Rust appends ``chunks.db``), or the
+            LanceDB ``.lancedb`` directory when ``backend`` is ``"lancedb"``.
         project_root: Root directory being indexed.
+        backend: ``"duckdb"`` or ``"lancedb"``. Selects how ``db_path`` is opened.
         force_reindex: Skip incremental diff — re-index every file.
         skip_embeddings: Skip embedding generation (e.g. --no-embeddings).
         config: Coordinator config object (for extracting indexing/embedding settings).
@@ -755,6 +775,13 @@ async def run_rust_pipeline(
 
     embedding_provider = _cfg_or(embedding_cfg, "provider", "", str)
     embedding_model = _resolved_embedding_model(embedding_cfg, embedding_provider)
+    if embedding_provider_obj is not None:
+        provider_name = getattr(embedding_provider_obj, "name", None)
+        provider_model = getattr(embedding_provider_obj, "model", None)
+        if provider_name:
+            embedding_provider = str(provider_name)
+        if provider_model:
+            embedding_model = str(provider_model)
     (
         embed_max_tokens_per_batch,
         embedding_matryoshka,
@@ -763,9 +790,7 @@ async def run_rust_pipeline(
         embedding_cfg, embedding_provider, embedding_model
     )
     embedding_api_key = getattr(embedding_cfg, "api_key", None)
-    if embedding_api_key is not None and hasattr(
-        embedding_api_key, "get_secret_value"
-    ):
+    if embedding_api_key is not None and hasattr(embedding_api_key, "get_secret_value"):
         embedding_api_key = embedding_api_key.get_secret_value()
     embedding_base_url = getattr(embedding_cfg, "base_url", None)
     embedding_azure_endpoint = getattr(embedding_cfg, "azure_endpoint", None)
@@ -784,6 +809,7 @@ async def run_rust_pipeline(
 
     config_dict = {
         "db_path": str(db_path.resolve()),
+        "backend": backend,
         "db_batch_size": db_batch_size,
         "compaction_threshold": compaction_threshold,
         "compaction_min_size_mb": 50,
@@ -824,11 +850,13 @@ async def run_rust_pipeline(
         ),
         "embedding_is_azure": bool(embedding_azure_endpoint),
         "embedding_azure_endpoint": embedding_azure_endpoint,
-        "embedding_azure_deployment": getattr(
-            embedding_cfg, "azure_deployment", None
-        ),
+        "embedding_azure_deployment": getattr(embedding_cfg, "azure_deployment", None),
         "embed_max_tokens_per_batch": embed_max_tokens_per_batch,
         "disk_usage_limit_mb": disk_usage_limit_mb,
+        "lance_optimize_fragment_threshold": int(
+            lance_optimize_fragment_threshold or 0
+        ),
+        "lance_index_type": lance_index_type or "",
     }
 
     # Build (absolute_path, relative_key) pairs from (path, hash) tuples.
@@ -879,14 +907,19 @@ async def run_rust_pipeline(
             ),
             embed_batch_callback=(
                 functools.partial(
+                    _embed_provider_instance,
+                    provider=embedding_provider_obj,
+                )
+                if embedding_provider_obj is not None
+                else functools.partial(
                     embed_batch_callback,
                     embedding_cfg=embedding_cfg,
                     cache=embed_cache,
                     analytics=analytics_current,
                 )
-                if not skip_embeddings
-                else None
-            ),
+            )
+            if not skip_embeddings
+            else None,
             progress_callback=progress_callback,
             incremental=not force_reindex,
             # Native OpenAI/VoyageAI embed calls record analytics directly

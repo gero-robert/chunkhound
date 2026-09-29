@@ -65,6 +65,10 @@ fn extract_opt_or_default<'py, T: FromPyObject<'py>>(
 pub(crate) struct PipelineConfig {
     // Storage
     pub db_path: PathBuf,
+    /// `"duckdb"` (default) or `"lancedb"`. DuckDB's `db_path` is the directory
+    /// that contains `chunks.db`. LanceDB's `db_path` is the `.lancedb`
+    /// directory itself.
+    pub backend: String,
     pub db_batch_size: usize,
     /// `None` means auto-compaction is disabled (mirrors Python's
     /// `DatabaseConfig.fragmentation_threshold_pct = None`).
@@ -108,13 +112,38 @@ pub(crate) struct PipelineConfig {
     pub embedding_azure_endpoint: Option<String>,
     pub embedding_azure_deployment: Option<String>,
     pub embed_max_tokens_per_batch: usize,
+
+    /// Lance-only. `0` disables fragment optimize on the store thread.
+    pub lance_optimize_fragment_threshold: u32,
+    /// Lance `lancedb_index_type`. Empty builds no vector index during optimize.
+    pub lance_index_type: String,
+}
+
+/// Concrete location the diff and store phases open.
+///
+/// DuckDB receives the parent directory and this appends `chunks.db`.
+/// LanceDB receives the `.lancedb` directory and this returns it unchanged.
+pub(crate) fn storage_path(db_path: &std::path::Path, backend: &str) -> PathBuf {
+    if db_path.as_os_str().is_empty() || db_path.as_os_str() == ":memory:" {
+        return PathBuf::from(":memory:");
+    }
+    if backend == "lancedb" {
+        db_path.to_path_buf()
+    } else {
+        db_path.join("chunks.db")
+    }
 }
 
 impl PipelineConfig {
+    pub(crate) fn storage_path(&self) -> PathBuf {
+        storage_path(&self.db_path, &self.backend)
+    }
+
     /// Extract configuration from a Python dict.
     pub fn from_py_dict(dict: &Bound<'_, PyDict>) -> PyResult<Self> {
         Ok(Self {
             db_path: extract_or(dict, "db_path", String::new())?.into(),
+            backend: extract_or(dict, "backend", "duckdb".to_string())?,
             db_batch_size: extract_or(dict, "db_batch_size", 100u64)? as usize,
             compaction_threshold: extract_opt_or_default(dict, "compaction_threshold", 0.30)?,
             compaction_min_size_mb: extract_or(dict, "compaction_min_size_mb", 50u64)?,
@@ -160,6 +189,12 @@ impl PipelineConfig {
             embedding_azure_deployment: extract_opt(dict, "embedding_azure_deployment")?,
             embed_max_tokens_per_batch: extract_or(dict, "embed_max_tokens_per_batch", 8191u64)?
                 .max(1) as usize,
+            lance_optimize_fragment_threshold: extract_or(
+                dict,
+                "lance_optimize_fragment_threshold",
+                0u64,
+            )? as u32,
+            lance_index_type: extract_or(dict, "lance_index_type", String::new())?,
         })
     }
 
@@ -197,6 +232,24 @@ mod tests {
     /// The `extension-module` PyO3 feature means a standalone `cargo test`
     /// binary cannot construct a real `Python<'_>` token (see lib.rs comment).
     /// Test the `ApiKey` redaction invariant directly on the struct instead.
+    #[test]
+    fn duckdb_storage_path_appends_chunks_db() {
+        let path = storage_path(std::path::Path::new("/idx/db"), "duckdb");
+        assert_eq!(path, std::path::PathBuf::from("/idx/db/chunks.db"));
+    }
+
+    #[test]
+    fn lancedb_storage_path_is_the_directory_itself() {
+        let path = storage_path(std::path::Path::new("/idx/lancedb.lancedb"), "lancedb");
+        assert_eq!(path, std::path::PathBuf::from("/idx/lancedb.lancedb"));
+    }
+
+    #[test]
+    fn unknown_backend_keeps_the_duckdb_file_layout() {
+        let path = storage_path(std::path::Path::new("/idx/db"), "other");
+        assert_eq!(path, std::path::PathBuf::from("/idx/db/chunks.db"));
+    }
+
     #[test]
     fn api_key_debug_is_redacted() {
         let key = ApiKey("secret-test-key".to_string());

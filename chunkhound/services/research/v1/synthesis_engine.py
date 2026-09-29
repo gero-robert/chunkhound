@@ -16,6 +16,7 @@ The synthesis engine uses:
     - Citation management for source tracking
 """
 
+import json
 from typing import Any
 
 from loguru import logger
@@ -51,6 +52,17 @@ def _synthesis_output_allowance(
     if llm.synthesis_output_limit_policy.output_limits_enabled:
         return legacy_allowance
     return PROVIDER_MANAGED_OUTPUT
+
+
+def _chunk_section(chunk: dict[str, Any]) -> str:
+    """Line-marked chunk text plus the metadata stored on the row."""
+    start_line = chunk.get("start_line", "?")
+    end_line = chunk.get("end_line", "?")
+    section = f"# Lines {start_line}-{end_line}\n{chunk.get('content', '')}"
+    meta = chunk.get("metadata")
+    if isinstance(meta, dict) and meta:
+        section += "\nmetadata: " + json.dumps(meta, sort_keys=True)
+    return section
 
 
 def _format_output_allowance(allowance: int | OutputLimitIntent) -> str:
@@ -221,16 +233,7 @@ class SynthesisEngine:
                 )
 
                 # Build content with line markers for each chunk
-                chunk_sections = []
-                for chunk in sorted_chunks:
-                    start_line = chunk.get("start_line", "?")
-                    end_line = chunk.get("end_line", "?")
-                    chunk_code = chunk.get("content", "")
-
-                    # Add line marker before chunk code
-                    chunk_sections.append(
-                        f"# Lines {start_line}-{end_line}\n{chunk_code}"
-                    )
+                chunk_sections = [_chunk_section(chunk) for chunk in sorted_chunks]
 
                 file_content = "\n\n".join(chunk_sections)
             else:
@@ -393,14 +396,7 @@ class SynthesisEngine:
                 sorted_chunks = sorted(
                     file_chunks, key=lambda c: c.get("start_line", 0)
                 )
-                chunk_sections = []
-                for chunk in sorted_chunks:
-                    start_line = chunk.get("start_line", "?")
-                    end_line = chunk.get("end_line", "?")
-                    chunk_code = chunk.get("content", "")
-                    chunk_sections.append(
-                        f"# Lines {start_line}-{end_line}\n{chunk_code}"
-                    )
+                chunk_sections = [_chunk_section(chunk) for chunk in sorted_chunks]
                 file_content = "\n\n".join(chunk_sections)
             else:
                 file_content = content

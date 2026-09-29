@@ -2,6 +2,7 @@ use crate::error::DbError;
 use crate::types::{BatchResult, DbFileEntry, DbWriterBatch};
 
 pub mod duckdb_backend;
+mod lance_backend;
 pub(crate) use duckdb_backend::check_disk_usage_limit;
 pub use duckdb_backend::DuckDbHnswBackend;
 
@@ -76,8 +77,21 @@ pub struct DbConfig {
     /// `indexing.db_batch_size`). Must be >= 1 — callers should clamp before
     /// constructing this struct, since `slice::chunks(0)` panics.
     pub insert_batch_size: usize,
+    /// Lance fragment count at which the store thread compacts and builds the
+    /// configured vector index. `0` leaves Lance compaction off. DuckDB ignores it.
+    pub lance_optimize_fragment_threshold: u32,
+    /// Lance `lancedb_index_type` (`ivf_hnsw_sq`, `ivf_rq`, or empty).
+    pub lance_index_type: String,
 }
 
 pub fn create_backend(cfg: DbConfig) -> Box<dyn DbBackend> {
-    Box::new(DuckDbHnswBackend::new(cfg))
+    let is_lance = std::path::Path::new(&cfg.db_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        == Some("lancedb");
+    if is_lance {
+        Box::new(lance_backend::LanceCallbackBackend::new(cfg))
+    } else {
+        Box::new(DuckDbHnswBackend::new(cfg))
+    }
 }
