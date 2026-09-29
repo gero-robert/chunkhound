@@ -8,6 +8,7 @@ calls this module, and search/research open the same tables with ``lancedb``.
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 
@@ -68,6 +69,15 @@ def read_file_states(directory: str) -> str:
     return json.dumps(rows)
 
 
+# Next file id per database directory. Seeded once from MAX(id) and only
+# increased, including across deletes, so a removed id is not reused.
+_file_id_counters: dict[str, int] = {}
+
+
+def _db_key(directory: str) -> str:
+    return os.path.normcase(os.path.abspath(directory))
+
+
 def _next_file_id(files: Any | None) -> int:
     if files is None:
         return 1
@@ -75,6 +85,27 @@ def _next_file_id(files: Any | None) -> int:
     if arrow.num_rows == 0:
         return 1
     return int(max(arrow.column("id").to_pylist())) + 1
+
+
+def _seed_file_id_counter(directory: str, files: Any | None) -> None:
+    key = _db_key(directory)
+    if key in _file_id_counters:
+        return
+    _file_id_counters[key] = _next_file_id(files)
+
+
+def _allocate_file_id(directory: str) -> int:
+    key = _db_key(directory)
+    file_id = _file_id_counters[key]
+    _file_id_counters[key] = file_id + 1
+    return file_id
+
+
+def _observe_file_id(directory: str, file_id: int) -> None:
+    key = _db_key(directory)
+    nxt = file_id + 1
+    if nxt > _file_id_counters.get(key, 1):
+        _file_id_counters[key] = nxt
 
 
 def _delete_where(table: Any | None, predicate: str) -> None:
@@ -127,18 +158,40 @@ def apply_deletes(directory: str, payload: str) -> str:
     return json.dumps({"removed": removed})
 
 
+def _file_row(file: dict[str, Any], file_id: int) -> dict[str, Any]:
+    return {
+        "id": file_id,
+        "path": file.get("path") or "",
+        "size": int(file.get("size_bytes") or 0),
+        "modified_time": float(file.get("mtime") or 0.0),
+        "content_hash": file.get("content_hash") or "",
+        "indexed_time": time.time(),
+        "language": file.get("language") or "",
+        "encoding": "utf-8",
+        "line_count": 0,
+        "skip_reason": file.get("skip_reason"),
+    }
+
+
 def write_batch(directory: str, payload: str) -> str:
     """Apply one ``DbWriterBatch`` JSON document. Returns result JSON."""
-    apply_deletes(directory, payload)
     batch = json.loads(payload)
+    # Seed before deletes. Otherwise a deleted max id becomes the next id.
+    _seed_file_id_counter(directory, _table(_connect(directory), "files"))
+    apply_deletes(directory, payload)
     db = _connect(directory)
-    files = _table(db, "files")
 
     file_ids: list[int] = []
+    file_rows: list[dict[str, Any]] = []
     chunk_rows: list[dict[str, Any]] = []
     embeddings_written = 0
     dims: int | None = None
-    for file in batch.get("files") or []:
+    files = batch.get("files") or []
+    for file in files:
+        existing = file.get("existing_file_id")
+        if existing is not None:
+            _observe_file_id(directory, int(existing))
+    for file in files:
         for chunk in file.get("chunks") or []:
             embedding = chunk.get("embedding")
             if embedding:
@@ -147,26 +200,14 @@ def write_batch(directory: str, payload: str) -> str:
         if dims is not None:
             break
 
-    for file in batch.get("files") or []:
+    for file in files:
         existing = file.get("existing_file_id")
         if existing is not None:
             file_id = int(existing)
         else:
-            file_id = _next_file_id(files)
+            file_id = _allocate_file_id(directory)
         file_ids.append(file_id)
-        file_row = {
-            "id": file_id,
-            "path": file.get("path") or "",
-            "size": int(file.get("size_bytes") or 0),
-            "modified_time": float(file.get("mtime") or 0.0),
-            "content_hash": file.get("content_hash") or "",
-            "indexed_time": time.time(),
-            "language": file.get("language") or "",
-            "encoding": "utf-8",
-            "line_count": 0,
-            "skip_reason": file.get("skip_reason"),
-        }
-        files = _add_rows(db, "files", [file_row], get_files_schema())
+        file_rows.append(_file_row(file, file_id))
         for chunk in file.get("chunks") or []:
             start_line = chunk.get("start_line")
             end_line = chunk.get("end_line")
@@ -198,6 +239,8 @@ def write_batch(directory: str, payload: str) -> str:
                     "metadata": chunk.get("metadata"),
                 }
             )
+    if file_rows:
+        _add_rows(db, "files", file_rows, get_files_schema())
     if chunk_rows:
         _add_rows(db, "chunks", chunk_rows, get_chunks_schema(dims))
     return json.dumps(

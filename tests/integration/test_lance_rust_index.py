@@ -171,3 +171,50 @@ def test_identical_text_at_different_lines_gets_distinct_chunk_ids(tmp_path):
     ids = [row["id"] for row in rows]
     assert len(ids) == 2
     assert ids[0] != ids[1]
+
+
+def _bare_file(path: str, existing: int | None = None) -> dict:
+    return {
+        "existing_file_id": existing,
+        "path": path,
+        "mtime": 1.0,
+        "size_bytes": 1,
+        "content_hash": "h",
+        "language": "python",
+        "skip_reason": None,
+        "chunks": [],
+    }
+
+
+def test_one_batch_of_file_rows_is_one_fragment_and_ids_are_not_reused(tmp_path):
+    from chunkhound.providers.database.lance_store import write_batch
+    from chunkhound.providers.database.lancedb_provider import LanceDBProvider
+
+    db_dir = tmp_path / "lancedb.lancedb"
+    first = json.dumps(
+        {
+            "files": [_bare_file("a.py"), _bare_file("b.py"), _bare_file("c.py")],
+            "delete_paths": [],
+        }
+    )
+    write_batch(str(db_dir), first)
+    import lancedb
+
+    files = lancedb.connect(str(db_dir)).open_table("files")
+    rows = files.search().to_list()
+    assert LanceDBProvider._fragment_count(files) == 1
+    assert sorted(row["id"] for row in rows) == [1, 2, 3]
+
+    second = json.dumps(
+        {
+            "files": [_bare_file("c.py", existing=3), _bare_file("d.py")],
+            "delete_paths": [],
+        }
+    )
+    write_batch(str(db_dir), second)
+    files = lancedb.connect(str(db_dir)).open_table("files")
+    rows = files.search().to_list()
+    by_path = {row["path"]: int(row["id"]) for row in rows}
+    assert by_path == {"a.py": 1, "b.py": 2, "c.py": 3, "d.py": 4}
+    assert len(rows) == 4
+    assert LanceDBProvider._fragment_count(files) == 2
