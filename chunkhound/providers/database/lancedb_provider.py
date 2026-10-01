@@ -221,17 +221,59 @@ def _serialize_metadata(metadata: dict | None) -> str | None:
     return json.dumps(metadata) if metadata else None
 
 
-def _deserialize_metadata(metadata_json: str | float | None) -> dict:
+def _deserialize_metadata(metadata_json: str | float | dict | None) -> dict:
     """Deserialize chunk metadata from JSON string.
 
     Handles pandas NaN values (float) which represent NULL string fields.
+    Callers read metadata as a dict, including metadata constants.
     """
-    if metadata_json is None or (isinstance(metadata_json, float) and np.isnan(metadata_json)):
+    if isinstance(metadata_json, dict):
+        return metadata_json
+    if metadata_json is None or (
+        isinstance(metadata_json, float) and np.isnan(metadata_json)
+    ):
         return {}
     if isinstance(metadata_json, str):
         return json.loads(metadata_json)
     # Handle unexpected types by converting to string first
     return json.loads(str(metadata_json))
+
+
+def _chunk_record(row: dict[str, Any]) -> dict[str, Any]:
+    """Chunk dict in the shape DuckDB returns to callers."""
+    code = row.get("content") or ""
+    symbol = row.get("name") or ""
+    return {
+        "id": row["id"],
+        "file_id": row["file_id"],
+        "chunk_type": row.get("chunk_type", ""),
+        "symbol": symbol,
+        "name": symbol,
+        "code": code,
+        "content": code,
+        "start_line": row.get("start_line", 0),
+        "end_line": row.get("end_line", 0),
+        "start_byte": stored_byte(row.get("start_byte")),
+        "end_byte": stored_byte(row.get("end_byte")),
+        "language": row.get("language", ""),
+        "created_at": row.get("created_time"),
+        "updated_at": None,
+        "metadata": _deserialize_metadata(row.get("metadata")),
+    }
+
+
+def _cosine(query: list[float], vector: Any) -> float | None:
+    """Cosine similarity, or None when the stored vector cannot be scored."""
+    if not _has_valid_embedding(vector):
+        return None
+    stored = np.asarray(vector, dtype=np.float64)
+    wanted = np.asarray(query, dtype=np.float64)
+    if stored.shape != wanted.shape or stored.size == 0:
+        return None
+    denom = float(np.linalg.norm(wanted) * np.linalg.norm(stored))
+    if denom == 0.0:
+        return None
+    return float(np.dot(wanted, stored) / denom)
 
 
 def _sql_literal(value: str) -> str:
@@ -1258,7 +1300,7 @@ class LanceDBProvider(SerialDatabaseProvider):
                     end_byte=stored_byte(result.get("end_byte")),
                     metadata=_deserialize_metadata(result.get("metadata")),
                 )
-            return result
+            return _chunk_record(result)
         except Exception as e:
             logger.error(f"Error getting chunk by ID: {e}")
             return None
@@ -1303,7 +1345,7 @@ class LanceDBProvider(SerialDatabaseProvider):
                     )
                     for result in results
                 ]
-            return results
+            return [_chunk_record(result) for result in results]
         except Exception as e:
             logger.error(f"Error getting chunks by file ID: {e}")
             return []
@@ -1735,21 +1777,53 @@ class LanceDBProvider(SerialDatabaseProvider):
         self, chunk_id: int, provider: str, model: str
     ) -> Embedding | None:
         """Get embedding for specific chunk, provider, and model."""
-        chunk = self.get_chunk_by_id(chunk_id)
-        if not chunk or not chunk.get("embedding"):
-            return None
-
-        created_time = chunk.get("created_time", time.time())
-        created_at = datetime.fromtimestamp(created_time) if created_time else None
-
-        return Embedding(
-            chunk_id=chunk_id,
-            provider=chunk.get("provider", provider),
-            model=chunk.get("model", model),
-            dims=len(chunk["embedding"]),
-            vector=chunk["embedding"],
-            created_at=created_at,
+        return self._execute_in_db_thread_sync(
+            "get_embedding_by_chunk_id", chunk_id, provider, model
         )
+
+    def _executor_get_embedding_by_chunk_id(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        chunk_id: int,
+        provider: str,
+        model: str,
+    ) -> Embedding | None:
+        """Load the vector columns directly.
+
+        The public chunk dict does not include the embedding column.
+        """
+        if not self._chunks_table:
+            return None
+        try:
+            rows = (
+                self._chunks_table.to_lance()
+                .to_table(
+                    columns=["id", "embedding", "provider", "model", "created_time"],
+                    filter=f"id = {int(chunk_id)}",
+                )
+                .to_pylist()
+            )
+        except Exception as e:
+            logger.error(f"Error getting embedding for chunk {chunk_id}: {e}")
+            return None
+        for row in rows:
+            vector = row.get("embedding")
+            if hasattr(vector, "tolist"):
+                vector = vector.tolist()
+            if not isinstance(vector, list) or not vector:
+                continue
+            created_time = row.get("created_time") or time.time()
+            created_at = datetime.fromtimestamp(created_time) if created_time else None
+            return Embedding(
+                chunk_id=chunk_id,
+                provider=row.get("provider") or provider,
+                model=row.get("model") or model,
+                dims=len(vector),
+                vector=vector,
+                created_at=created_at,
+            )
+        return None
 
     def list_chunk_ids_without_embeddings(
         self, provider: str, model: str, page_size: int = 1000
@@ -2082,6 +2156,77 @@ class LanceDBProvider(SerialDatabaseProvider):
             return []
 
     # Search Operations (delegate to base class which uses executor)
+    def _count_stored_embeddings(self, provider: str, model: str) -> int:
+        """Rows that hold a vector for this provider and model."""
+        if self._chunks_table is None:
+            return 0
+        return int(
+            self._chunks_table.count_rows(
+                "embedding IS NOT NULL AND "
+                f"provider = '{_sql_literal(provider)}' AND "
+                f"model = '{_sql_literal(model)}'"
+            )
+        )
+
+    def _count_file_embeddings(self, file_id: int) -> int:
+        """Valid vectors stored on chunks for one file."""
+        if self._chunks_table is None:
+            return 0
+        try:
+            rows = (
+                self._chunks_table.to_lance()
+                .to_table(
+                    columns=["id", "embedding"],
+                    filter=f"file_id = {int(file_id)}",
+                )
+                .to_pylist()
+            )
+        except Exception as e:
+            logger.error(f"Error counting embeddings for file {file_id}: {e}")
+            return 0
+        return sum(
+            1
+            for row in _deduplicate_by_id(rows)
+            if _has_valid_embedding(row.get("embedding"))
+        )
+
+    def _executor_get_chunk_similarities(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        chunk_ids: list[int],
+        query_embedding: list[float],
+        provider: str,
+        model: str,
+    ) -> dict[int, float]:
+        """Cosine similarity between a query vector and stored chunk embeddings."""
+        if not self._chunks_table or not chunk_ids:
+            return {}
+        scores: dict[int, float] = {}
+        provider_sql = _sql_literal(provider)
+        model_sql = _sql_literal(model)
+        dataset = self._chunks_table.to_lance()
+        for batch in _iter_batches([int(chunk_id) for chunk_id in chunk_ids], 500):
+            ids_str = ",".join(str(chunk_id) for chunk_id in batch)
+            scanner = dataset.scanner(
+                columns=["id", "embedding"],
+                filter=(
+                    "embedding IS NOT NULL AND "
+                    f"provider = '{provider_sql}' AND "
+                    f"model = '{model_sql}' AND "
+                    f"id IN ({ids_str})"
+                ),
+                batch_size=max(1, len(batch)),
+            )
+            rows: list[dict[str, Any]] = []
+            for record_batch in scanner.to_batches():
+                rows.extend(record_batch.to_pylist())
+            for row in _deduplicate_by_id(rows):
+                score = _cosine(query_embedding, row.get("embedding"))
+                if score is not None:
+                    scores[int(row["id"])] = score
+        return scores
+
     def _executor_search_semantic(
         self,
         conn: Any,
@@ -2196,11 +2341,20 @@ class LanceDBProvider(SerialDatabaseProvider):
                 }
                 formatted_results.append(formatted_result)
 
+            # The ANN query is limited to this page. The reported total is the
+            # number of stored embeddings, matching DuckDB's count.
+            if threshold is None:
+                total_count = self._count_stored_embeddings(provider, model)
+            else:
+                total_count = len(results)
             pagination = {
                 "offset": offset,
-                "page_size": len(paginated_results),
-                "has_more": len(results) > offset + page_size,
-                "total": len(results),
+                "page_size": page_size,
+                "has_more": offset + page_size < total_count,
+                "next_offset": offset + page_size
+                if offset + page_size < total_count
+                else None,
+                "total": total_count,
             }
 
             return formatted_results, pagination
@@ -2581,13 +2735,7 @@ class LanceDBProvider(SerialDatabaseProvider):
         return {
             "file_id": file_id,
             "chunk_count": len(chunks),
-            "embedding_count": sum(
-                1
-                for chunk in chunks
-                if chunk.get("embedding") is not None
-                and isinstance(chunk.get("embedding"), (list, np.ndarray))
-                and len(chunk.get("embedding", [])) > 0
-            ),
+            "embedding_count": self._count_file_embeddings(file_id),
         }
 
     def get_provider_stats(self, provider: str, model: str) -> dict[str, Any]:
