@@ -20,6 +20,7 @@ from chunkhound.providers.database.lancedb_provider import (
     file_name_and_extension,
     get_chunks_schema,
     get_files_schema,
+    stored_byte,
 )
 from chunkhound.utils.chunk_hashing import generate_chunk_id
 
@@ -119,19 +120,109 @@ def _delete_where(table: Any | None, predicate: str) -> None:
     table.delete(predicate)
 
 
-def _add_rows(db: Any, name: str, rows: list[dict[str, Any]], schema: Any) -> Any:
+def _embedding_width(schema: Any) -> int | None:
     import pyarrow as pa
 
-    table = _table(db, name)
+    if schema is None or "embedding" not in schema.names:
+        return None
+    field_type = schema.field("embedding").type
+    if pa.types.is_fixed_size_list(field_type):
+        return int(field_type.list_size)
+    return None
+
+
+def _vector_width(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _restored_chunk(row: dict[str, Any], wanted: int) -> dict[str, Any]:
+    """Keep a chunk when the embedding column changes width.
+
+    A vector of the new width is kept. Any other vector is cleared, matching
+    the Python provider's one-time schema migration.
+    """
+    embedding = row.get("embedding")
+    if _vector_width(embedding) == wanted:
+        if hasattr(embedding, "tolist"):
+            embedding = embedding.tolist()
+        provider = row.get("provider") or ""
+        model = row.get("model") or ""
+    else:
+        embedding = None
+        provider = ""
+        model = ""
+    return {
+        "id": int(row["id"]),
+        "file_id": int(row["file_id"]),
+        "content": row.get("content") or "",
+        "start_line": int(row.get("start_line") or 0),
+        "end_line": int(row.get("end_line") or 0),
+        "chunk_type": row.get("chunk_type") or "",
+        "language": row.get("language") or "",
+        "name": row.get("name") or "",
+        "embedding": embedding,
+        "provider": provider,
+        "model": model,
+        "created_time": float(row.get("created_time") or 0.0),
+        "metadata": row.get("metadata"),
+        "start_byte": stored_byte(row.get("start_byte")),
+        "end_byte": stored_byte(row.get("end_byte")),
+    }
+
+
+def _align_chunks_table(db: Any, schema: Any) -> Any:
+    """Open the chunks table, recreating it when the vector width differs.
+
+    Connect creates the table from ``provider.dims``. An unknown Voyage model
+    reports 1024 until a response arrives, while the Rust embedder stores the
+    native width. Adding those vectors to the fallback column fails.
+    """
+    import pyarrow as pa
+
+    table = _table(db, "chunks")
     if table is None:
         # Schema-only create. Passing an all-null embedding column through
         # create_table makes lancedb infer a list size and raise.
-        db.create_table(name, schema=schema)
-        table = db.open_table(name)
-    elif name == "chunks":
-        ensure_chunk_byte_columns(table)
-    elif name == "files":
-        ensure_file_name_columns(table)
+        db.create_table("chunks", schema=schema)
+        return db.open_table("chunks")
+    ensure_chunk_byte_columns(table)
+    wanted = _embedding_width(schema)
+    current = _embedding_width(table.schema)
+    if wanted is None or current == wanted:
+        return table
+    rows = table.to_arrow().to_pylist() if table.count_rows() else []
+    logger.info(
+        "Recreating Lance chunks table at embedding width {} "
+        "(was {}), keeping {} chunks",
+        wanted,
+        current,
+        len(rows),
+    )
+    db.drop_table("chunks")
+    db.create_table("chunks", schema=schema)
+    if rows:
+        restored = [_restored_chunk(row, wanted) for row in rows]
+        db.open_table("chunks").add(pa.Table.from_pylist(restored, schema=schema))
+    return db.open_table("chunks")
+
+
+def _add_rows(db: Any, name: str, rows: list[dict[str, Any]], schema: Any) -> Any:
+    import pyarrow as pa
+
+    if name == "chunks":
+        table = _align_chunks_table(db, schema)
+    else:
+        table = _table(db, name)
+        if table is None:
+            db.create_table(name, schema=schema)
+            table = db.open_table(name)
+        elif name == "files":
+            ensure_file_name_columns(table)
     if rows:
         table.add(pa.Table.from_pylist(rows, schema=schema))
     return table
