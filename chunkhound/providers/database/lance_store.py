@@ -15,6 +15,7 @@ from typing import Any
 from loguru import logger
 
 from chunkhound.providers.database.lancedb_provider import (
+    _sql_literal,
     ensure_chunk_byte_columns,
     ensure_file_name_columns,
     file_name_and_extension,
@@ -118,6 +119,36 @@ def _delete_where(table: Any | None, predicate: str) -> None:
     if table is None:
         return
     table.delete(predicate)
+
+
+# Split path lists so each Lance IN predicate stays bounded.
+_DELETE_PATH_BATCH = 500
+
+
+def _file_ids_for_paths(files: Any, paths: list[str]) -> list[int]:
+    """Ids whose path is in ``paths``. Lance applies the filter."""
+    dataset = files.to_lance()
+    found: list[int] = []
+    for offset in range(0, len(paths), _DELETE_PATH_BATCH):
+        batch = paths[offset : offset + _DELETE_PATH_BATCH]
+        literals = ", ".join(f"'{_sql_literal(path)}'" for path in batch)
+        table = dataset.to_table(columns=["id"], filter=f"path IN ({literals})")
+        found.extend(int(file_id) for file_id in table.column("id").to_pylist())
+    return found
+
+
+def _delete_file_ids(
+    files: Any | None, chunks: Any | None, file_ids: list[int]
+) -> int:
+    """Delete chunks and file rows for ``file_ids``. Returns how many files."""
+    removed = 0
+    for offset in range(0, len(file_ids), _DELETE_PATH_BATCH):
+        batch = file_ids[offset : offset + _DELETE_PATH_BATCH]
+        id_list = ", ".join(str(int(file_id)) for file_id in batch)
+        _delete_where(chunks, f"file_id IN ({id_list})")
+        _delete_where(files, f"id IN ({id_list})")
+        removed += len(batch)
+    return removed
 
 
 def _embedding_width(schema: Any) -> int | None:
@@ -236,17 +267,9 @@ def apply_deletes(directory: str, payload: str) -> str:
     chunks = _table(db, "chunks")
     removed = 0
 
-    def ids_for(path: str) -> list[int]:
-        if files is None:
-            return []
-        rows = files.to_lance().to_table(columns=["id", "path"]).to_pylist()
-        return [int(row["id"]) for row in rows if row["path"] == path]
-
-    for path in batch.get("delete_paths") or []:
-        for file_id in ids_for(str(path)):
-            _delete_where(chunks, f"file_id = {file_id}")
-            _delete_where(files, f"id = {file_id}")
-            removed += 1
+    paths = [str(path) for path in batch.get("delete_paths") or []]
+    if paths and files is not None:
+        removed += _delete_file_ids(files, chunks, _file_ids_for_paths(files, paths))
     for file in batch.get("files") or []:
         existing = file.get("existing_file_id")
         if existing is None:

@@ -654,3 +654,120 @@ def test_quoted_path_keeps_its_own_name_and_extension(tmp_path):
         assert after["skip_reason"] == "skip"
     finally:
         provider.disconnect()
+
+
+def test_delete_paths_matches_paths_in_lance(tmp_path, monkeypatch):
+    """Orphan deletion asks Lance which paths match, then removes only those rows."""
+    import lancedb
+
+    from chunkhound.providers.database.lance_store import apply_deletes, write_batch
+
+    quoted = "x' OR path = 'keep.py"
+    kept = ("keep.py", "it's.py")
+    dropped = ("gone.py", quoted)
+    records = []
+    for path in (*kept, *dropped):
+        record = _bare_file(path)
+        record["chunks"] = [
+            {
+                "chunk_type": "function",
+                "symbol": "f",
+                "code": path,
+                "start_line": 1,
+                "end_line": 1,
+                "start_byte": None,
+                "end_byte": None,
+                "language": "python",
+                "metadata": None,
+                "embedding": None,
+                "provider": None,
+                "model": None,
+            }
+        ]
+        records.append(record)
+
+    db_dir = tmp_path / "lancedb.lancedb"
+    write_batch(str(db_dir), json.dumps({"files": records, "delete_paths": []}))
+    stored_count = len(records)
+    matched: list[int] = []
+
+    class _Dataset:
+        def __init__(self, dataset):
+            self._dataset = dataset
+
+        def to_table(self, *args, **kwargs):
+            filt = kwargs.get("filter")
+            if filt is None and len(args) > 1:
+                filt = args[1]
+            if not filt:
+                raise AssertionError("full table load")
+            table = self._dataset.to_table(*args, **kwargs)
+            assert table.num_rows < stored_count, table.num_rows
+            matched.append(table.num_rows)
+            return table
+
+        def __getattr__(self, name):
+            return getattr(self._dataset, name)
+
+    class _Files:
+        def __init__(self, table):
+            self._table = table
+
+        def to_lance(self):
+            return _Dataset(self._table.to_lance())
+
+        def delete(self, predicate):
+            return self._table.delete(predicate)
+
+        def __getattr__(self, name):
+            return getattr(self._table, name)
+
+    class _DB:
+        def __init__(self, db):
+            self._db = db
+
+        def table_names(self):
+            return self._db.table_names()
+
+        def open_table(self, name):
+            table = self._db.open_table(name)
+            if name == "files":
+                return _Files(table)
+            return table
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+    real_connect = lancedb.connect
+
+    def _connect(directory, *args, **kwargs):
+        return _DB(real_connect(directory, *args, **kwargs))
+
+    monkeypatch.setattr(lancedb, "connect", _connect)
+    result = json.loads(
+        apply_deletes(
+            str(db_dir),
+            json.dumps(
+                {
+                    "files": [],
+                    "delete_paths": ["gone.py", quoted, "missing.py"],
+                }
+            ),
+        )
+    )
+    assert result["removed"] == 2
+    assert matched == [2]
+    untouched = json.loads(
+        apply_deletes(str(db_dir), json.dumps({"files": [], "delete_paths": []}))
+    )
+    assert untouched["removed"] == 0
+    assert matched == [2]
+    monkeypatch.setattr(lancedb, "connect", real_connect)
+
+    db = lancedb.connect(str(db_dir))
+    left = sorted(row["path"] for row in db.open_table("files").to_arrow().to_pylist())
+    chunks = sorted(
+        row["content"] for row in db.open_table("chunks").to_arrow().to_pylist()
+    )
+    assert left == sorted(kept)
+    assert chunks == sorted(kept)
