@@ -5,6 +5,7 @@ Expands raw start/end lines to encompass complete language constructs
 and brace-matching for C-family languages.
 """
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,24 @@ from chunkhound.services.research.shared.models import (
     EXTRA_CONTEXT_TOKENS,
     MAX_BOUNDARY_EXPANSION_LINES,
 )
+
+
+def _metadata_dict(raw: Any) -> dict[str, Any]:
+    """Return chunk metadata as a dict, parsing a JSON string when needed."""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def expand_to_natural_boundaries(
@@ -53,8 +72,9 @@ def expand_to_natural_boundaries(
         end_idx = min(len(lines), end_line + context_lines)
         return start_idx, end_idx
 
-    # Check if chunk metadata indicates this is already a complete unit
-    metadata = chunk.get("metadata", {})
+    # Check if chunk metadata indicates this is already a complete unit.
+    # Lance may still hand research a JSON string.
+    metadata = _metadata_dict(chunk.get("metadata", {}))
     chunk_kind = metadata.get("kind") or chunk.get("symbol_type", "")
 
     # If this chunk is marked as a complete function/class/method, use its exact boundaries

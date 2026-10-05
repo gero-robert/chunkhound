@@ -221,11 +221,12 @@ def _serialize_metadata(metadata: dict | None) -> str | None:
     return json.dumps(metadata) if metadata else None
 
 
-def _deserialize_metadata(metadata_json: str | float | dict | None) -> dict:
-    """Deserialize chunk metadata from JSON string.
+def _deserialize_metadata(metadata_json: Any) -> dict[str, Any]:
+    """Deserialize chunk metadata from Lance storage into a dict.
 
-    Handles pandas NaN values (float) which represent NULL string fields.
-    Callers read metadata as a dict, including metadata constants.
+    Storage is a JSON string column. Callers sometimes also pass an already
+    parsed dict. Handles pandas NaN (NULL string fields). Never returns a
+    bare str. Consumers call ``.get`` on the result.
     """
     if isinstance(metadata_json, dict):
         return metadata_json
@@ -234,9 +235,24 @@ def _deserialize_metadata(metadata_json: str | float | dict | None) -> dict:
     ):
         return {}
     if isinstance(metadata_json, str):
-        return json.loads(metadata_json)
-    # Handle unexpected types by converting to string first
-    return json.loads(str(metadata_json))
+        if not metadata_json.strip():
+            return {}
+        try:
+            parsed = json.loads(metadata_json)
+        except json.JSONDecodeError:
+            return {}
+        # A second encode leaves a JSON string after the first parse.
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+    try:
+        parsed = json.loads(str(metadata_json))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _chunk_record(row: dict[str, Any]) -> dict[str, Any]:
