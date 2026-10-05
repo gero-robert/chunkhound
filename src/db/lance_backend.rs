@@ -62,6 +62,27 @@ struct WriteOutcome {
     embeddings_written: u64,
 }
 
+/// Delete request without chunk text or embeddings. Those cross into
+/// Python only in `write_batch`.
+fn delete_message(batch: &DbWriterBatch) -> Option<String> {
+    let files: Vec<serde_json::Value> = batch
+        .files
+        .iter()
+        .filter_map(|file| file.existing_file_id)
+        .map(|file_id| serde_json::json!({"existing_file_id": file_id}))
+        .collect();
+    if batch.delete_paths.is_empty() && files.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "delete_paths": batch.delete_paths,
+            "files": files,
+        })
+        .to_string(),
+    )
+}
+
 impl DbBackend for LanceCallbackBackend {
     fn open(&mut self) -> Result<(), DbError> {
         Ok(())
@@ -75,9 +96,9 @@ impl DbBackend for LanceCallbackBackend {
     }
 
     fn prepare_write(&mut self, batch: &DbWriterBatch) -> Result<(), DbError> {
-        // Orphan removal is applied only through prepare_write. A data batch
-        // also passes through here before write_batch, which deletes again.
-        let payload = serde_json::to_string(batch)?;
+        let Some(payload) = delete_message(batch) else {
+            return Ok(());
+        };
         self.call("apply_deletes", Some(&payload))?;
         Ok(())
     }
@@ -146,5 +167,65 @@ impl DbBackend for LanceCallbackBackend {
                 content_hash: row.content_hash,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_message;
+    use crate::types::{ChunkRecord, DbWriterBatch, FileRecord};
+
+    fn file_with_vector(existing_file_id: Option<i64>, code: &str) -> FileRecord {
+        FileRecord {
+            existing_file_id,
+            path: "src/a.py".into(),
+            mtime: Some(1.0),
+            size_bytes: Some(4),
+            content_hash: Some("hash".into()),
+            language: Some("python".into()),
+            skip_reason: None,
+            chunks: vec![ChunkRecord {
+                chunk_type: "function".into(),
+                symbol: Some("f".into()),
+                code: code.into(),
+                start_line: Some(1),
+                end_line: Some(2),
+                start_byte: None,
+                end_byte: None,
+                language: Some("python".into()),
+                metadata: None,
+                embedding: Some(vec![0.125; 4]),
+                provider: Some("fake".into()),
+                model: Some("fake-embeddings".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn delete_message_carries_paths_and_ids_only() {
+        let batch = DbWriterBatch {
+            files: vec![
+                file_with_vector(None, "new-chunk-text"),
+                file_with_vector(Some(7), "secret-chunk-text"),
+            ],
+            delete_paths: vec!["gone.py".into()],
+        };
+        let message = delete_message(&batch).expect("deletes present");
+        let value: serde_json::Value = serde_json::from_str(&message).expect("json");
+        assert_eq!(value["delete_paths"], serde_json::json!(["gone.py"]));
+        assert_eq!(value["files"], serde_json::json!([{"existing_file_id": 7}]));
+        assert!(!message.contains("secret-chunk-text"));
+        assert!(!message.contains("new-chunk-text"));
+        assert!(!message.contains("embedding"));
+        assert!(!message.contains("0.125"));
+    }
+
+    #[test]
+    fn delete_message_skips_a_batch_that_deletes_nothing() {
+        let batch = DbWriterBatch {
+            files: vec![file_with_vector(None, "new-chunk-text")],
+            delete_paths: vec![],
+        };
+        assert!(delete_message(&batch).is_none());
     }
 }

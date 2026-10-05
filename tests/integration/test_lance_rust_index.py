@@ -771,3 +771,86 @@ def test_delete_paths_matches_paths_in_lance(tmp_path, monkeypatch):
     )
     assert left == sorted(kept)
     assert chunks == sorted(kept)
+
+
+def _chunk(code: str) -> dict:
+    return {
+        "chunk_type": "function",
+        "symbol": "f",
+        "code": code,
+        "start_line": 1,
+        "end_line": 1,
+        "start_byte": None,
+        "end_byte": None,
+        "language": "python",
+        "metadata": None,
+        "embedding": [0.25, 0.5],
+        "provider": "fake",
+        "model": "fake-embeddings",
+    }
+
+
+def test_delete_uses_ids_and_paths_without_chunk_bodies(tmp_path):
+    """A delete needs paths and file ids. Replacing a file drops the old chunk."""
+    import lancedb
+
+    from chunkhound.providers.database.lance_store import apply_deletes, write_batch
+
+    def record(path: str, code: str) -> dict:
+        row = _bare_file(path)
+        row["chunks"] = [_chunk(code)]
+        return row
+
+    db_dir = tmp_path / "lancedb.lancedb"
+    written = json.loads(
+        write_batch(
+            str(db_dir),
+            json.dumps(
+                {
+                    "files": [
+                        record("keep.py", "keep-body"),
+                        record("gone.py", "path-body"),
+                        record("replaced.py", "id-body"),
+                    ],
+                    "delete_paths": [],
+                }
+            ),
+        )
+    )
+    keep_id, _gone_id, replaced_id = written["file_ids"]
+    slim = json.dumps(
+        {
+            "delete_paths": ["gone.py"],
+            "files": [{"existing_file_id": replaced_id}],
+        }
+    )
+    assert "path-body" not in slim
+    assert "id-body" not in slim
+    assert "0.25" not in slim
+    removed = json.loads(apply_deletes(str(db_dir), slim))
+    assert removed["removed"] == 2
+
+    replaced = json.loads(
+        write_batch(
+            str(db_dir),
+            json.dumps(
+                {
+                    "files": [
+                        {
+                            **_bare_file("keep.py", keep_id),
+                            "chunks": [_chunk("new-body")],
+                        }
+                    ],
+                    "delete_paths": [],
+                }
+            ),
+        )
+    )
+    assert replaced["file_ids"] == [keep_id]
+    db = lancedb.connect(str(db_dir))
+    paths = sorted(row["path"] for row in db.open_table("files").to_arrow().to_pylist())
+    bodies = sorted(
+        row["content"] for row in db.open_table("chunks").to_arrow().to_pylist()
+    )
+    assert paths == ["keep.py"]
+    assert bodies == ["new-body"]

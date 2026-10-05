@@ -285,12 +285,13 @@ def test_failed_write_restores_the_vector_index(tmp_path, monkeypatch):
         assert first["status"] == "success", first
         assert _ann_indexes(provider, wanted="ivfhnswsq")
 
-        def _fail_deletes(_db_path, _payload):
+        def _fail_write(_db_path, _payload):
             raise RuntimeError("write failed")
 
+        # Insert-only batches do not call apply_deletes.
         monkeypatch.setattr(
-            "chunkhound.providers.database.lance_store.apply_deletes",
-            _fail_deletes,
+            "chunkhound.providers.database.lance_store.write_batch",
+            _fail_write,
         )
         (root / "beta.py").write_text(
             "def beta_fn():\n    return 'beta'\n", encoding="utf-8"

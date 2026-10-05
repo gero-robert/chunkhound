@@ -261,20 +261,28 @@ def _add_rows(db: Any, name: str, rows: list[dict[str, Any]], schema: Any) -> An
 
 def apply_deletes(directory: str, payload: str) -> str:
     """Delete ``delete_paths`` and any chunks for files that will be replaced."""
-    batch = json.loads(payload)
+    return _apply_deletes(directory, json.loads(payload))
+
+
+def _apply_deletes(directory: str, batch: dict[str, Any]) -> str:
+    """Use the parsed batch so a write does not decode its embeddings twice."""
+    paths = [str(path) for path in batch.get("delete_paths") or []]
+    file_ids = [
+        int(file["existing_file_id"])
+        for file in batch.get("files") or []
+        if file.get("existing_file_id") is not None
+    ]
+    if not paths and not file_ids:
+        return json.dumps({"removed": 0})
+
     db = _connect(directory)
     files = _table(db, "files")
     chunks = _table(db, "chunks")
     removed = 0
 
-    paths = [str(path) for path in batch.get("delete_paths") or []]
     if paths and files is not None:
         removed += _delete_file_ids(files, chunks, _file_ids_for_paths(files, paths))
-    for file in batch.get("files") or []:
-        existing = file.get("existing_file_id")
-        if existing is None:
-            continue
-        file_id = int(existing)
+    for file_id in file_ids:
         _delete_where(chunks, f"file_id = {file_id}")
         _delete_where(files, f"id = {file_id}")
         removed += 1
@@ -308,7 +316,7 @@ def write_batch(directory: str, payload: str) -> str:
     batch = json.loads(payload)
     # Seed before deletes. Otherwise a deleted max id becomes the next id.
     _seed_file_id_counter(directory, _table(_connect(directory), "files"))
-    apply_deletes(directory, payload)
+    _apply_deletes(directory, batch)
     db = _connect(directory)
 
     file_ids: list[int] = []
