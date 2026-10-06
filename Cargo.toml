@@ -43,6 +43,15 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # (just computes signed headers/URLs) and has no tokio/async requirement,
 # matching this crate's fully-synchronous HTTP usage (see src/analytics/s3.rs).
 rusty-s3   = "0.5"
+# Same release as installed pylance 0.38.1. Cloud SDKs stay off.
+# The crate's `protoc` feature calls std::env::set_var from build.rs, which
+# does not compile on rustc 1.87+. Set PROTOC to a protoc binary instead.
+lance      = { version = "=0.38.1", default-features = false }
+arrow-array = "=56.1.0"
+arrow-schema = "=56.1.0"
+# lance 0.38.1 serializes DateTime, and its chrono dependency leaves serde off.
+chrono = { version = "0.4.41", default-features = false, features = ["std", "now", "serde"] }
+tokio = { version = "1", features = ["rt", "time", "net", "fs", "io-util", "sync"] }
 # Calendar/timestamp formatting for the analytics object key
 # (analytics/<repo>/<privacy_id>/<YYYY>/<MM>/<DD>/<iso8601>_<uuid>.jsonl) — chosen
 # over hand-rolled calendar math for correctness; no tokio requirement.

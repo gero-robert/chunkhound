@@ -1,6 +1,9 @@
-//! LanceDB store backend. Writes go through the installed `lancedb` package
-//! (`chunkhound.providers.database.lance_store`) because the matching native
-//! `lance` crate does not build without `protoc`.
+//! LanceDB store backend.
+//!
+//! Index deletes and inserts run in the `lance` crate (`lance_native`),
+//! without taking the GIL. The vector index, optimize, and file-state reads
+//! still go through `chunkhound.providers.database.lance_store`. Search and
+//! research open the same tables with installed `lancedb`.
 
 use pyo3::prelude::*;
 use serde::Deserialize;
@@ -55,32 +58,13 @@ struct FileStateRow {
     content_hash: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct WriteOutcome {
-    file_ids: Vec<i64>,
-    chunks_written: u64,
-    embeddings_written: u64,
-}
-
-/// Delete request without chunk text or embeddings. Those cross into
-/// Python only in `write_batch`.
-fn delete_message(batch: &DbWriterBatch) -> Option<String> {
-    let files: Vec<serde_json::Value> = batch
-        .files
-        .iter()
-        .filter_map(|file| file.existing_file_id)
-        .map(|file_id| serde_json::json!({"existing_file_id": file_id}))
-        .collect();
-    if batch.delete_paths.is_empty() && files.is_empty() {
-        return None;
-    }
-    Some(
-        serde_json::json!({
-            "delete_paths": batch.delete_paths,
-            "files": files,
-        })
-        .to_string(),
-    )
+/// True when the batch removes paths or replaces an existing file id.
+fn has_deletes(batch: &DbWriterBatch) -> bool {
+    !batch.delete_paths.is_empty()
+        || batch
+            .files
+            .iter()
+            .any(|file| file.existing_file_id.is_some())
 }
 
 impl DbBackend for LanceCallbackBackend {
@@ -96,22 +80,14 @@ impl DbBackend for LanceCallbackBackend {
     }
 
     fn prepare_write(&mut self, batch: &DbWriterBatch) -> Result<(), DbError> {
-        let Some(payload) = delete_message(batch) else {
+        if !has_deletes(batch) {
             return Ok(());
-        };
-        self.call("apply_deletes", Some(&payload))?;
-        Ok(())
+        }
+        crate::db::lance_native::apply_deletes(&self.db_path, batch).map_err(DbError::Other)
     }
 
     fn write_batch(&mut self, batch: &DbWriterBatch) -> Result<BatchResult, DbError> {
-        let payload = serde_json::to_string(batch)?;
-        let raw = self.call("write_batch", Some(&payload))?;
-        let outcome: WriteOutcome = serde_json::from_str(&raw)?;
-        Ok(BatchResult {
-            file_ids: outcome.file_ids,
-            chunks_written: outcome.chunks_written,
-            embeddings_written: outcome.embeddings_written,
-        })
+        crate::db::lance_native::write_index_batch(&self.db_path, batch).map_err(DbError::Other)
     }
 
     fn drop_all_hnsw_indexes(&mut self) -> Result<(), DbError> {
@@ -172,7 +148,7 @@ impl DbBackend for LanceCallbackBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::delete_message;
+    use super::has_deletes;
     use crate::types::{ChunkRecord, DbWriterBatch, FileRecord};
 
     fn file_with_vector(existing_file_id: Option<i64>, code: &str) -> FileRecord {
@@ -202,30 +178,25 @@ mod tests {
     }
 
     #[test]
-    fn delete_message_carries_paths_and_ids_only() {
-        let batch = DbWriterBatch {
-            files: vec![
-                file_with_vector(None, "new-chunk-text"),
-                file_with_vector(Some(7), "secret-chunk-text"),
-            ],
+    fn has_deletes_sees_paths_and_existing_ids() {
+        let with_path = DbWriterBatch {
+            files: vec![file_with_vector(None, "new-chunk-text")],
             delete_paths: vec!["gone.py".into()],
         };
-        let message = delete_message(&batch).expect("deletes present");
-        let value: serde_json::Value = serde_json::from_str(&message).expect("json");
-        assert_eq!(value["delete_paths"], serde_json::json!(["gone.py"]));
-        assert_eq!(value["files"], serde_json::json!([{"existing_file_id": 7}]));
-        assert!(!message.contains("secret-chunk-text"));
-        assert!(!message.contains("new-chunk-text"));
-        assert!(!message.contains("embedding"));
-        assert!(!message.contains("0.125"));
+        assert!(has_deletes(&with_path));
+        let with_id = DbWriterBatch {
+            files: vec![file_with_vector(Some(7), "secret-chunk-text")],
+            delete_paths: vec![],
+        };
+        assert!(has_deletes(&with_id));
     }
 
     #[test]
-    fn delete_message_skips_a_batch_that_deletes_nothing() {
+    fn has_deletes_skips_a_batch_that_deletes_nothing() {
         let batch = DbWriterBatch {
             files: vec![file_with_vector(None, "new-chunk-text")],
             delete_paths: vec![],
         };
-        assert!(delete_message(&batch).is_none());
+        assert!(!has_deletes(&batch));
     }
 }

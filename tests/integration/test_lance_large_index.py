@@ -285,13 +285,14 @@ def test_failed_write_restores_the_vector_index(tmp_path, monkeypatch):
         assert first["status"] == "success", first
         assert _ann_indexes(provider, wanted="ivfhnswsq")
 
-        def _fail_write(_db_path, _payload):
-            raise RuntimeError("write failed")
+        import pyarrow as pa
 
-        # Insert-only batches do not call apply_deletes.
-        monkeypatch.setattr(
-            "chunkhound.providers.database.lance_store.write_batch",
-            _fail_write,
+        # Narrow start_line to int32 so the native insert rejects the batch
+        # after the file row is stored. The writer then drops that file row.
+        # Chunk ids do not fit in int32. close() rebuilds the ANN index
+        # that the write dropped.
+        provider._chunks_table.alter_columns(
+            {"path": "start_line", "data_type": pa.int32()}
         )
         (root / "beta.py").write_text(
             "def beta_fn():\n    return 'beta'\n", encoding="utf-8"
@@ -299,6 +300,14 @@ def test_failed_write_restores_the_vector_index(tmp_path, monkeypatch):
         second = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
         assert second["status"] == "error", second
         assert _ann_indexes(provider, wanted="ivfhnswsq")
+        import lancedb
+
+        fresh = lancedb.connect(str(provider._db_path))
+        names = {
+            str(path).replace("\\", "/").rsplit("/", 1)[-1]
+            for path in fresh.open_table("files").to_arrow().column("path").to_pylist()
+        }
+        assert names == {"alpha.py"}, names
     finally:
         provider.disconnect()
 

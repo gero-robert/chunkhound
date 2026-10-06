@@ -21,10 +21,9 @@ use std::sync::{Arc, Mutex};
 
 #[pyfunction]
 fn write_lance_format_probe(py: Python<'_>, directory: String) -> PyResult<()> {
-    // The lance crate that matches installed pylance 0.38.1 needs protoc to
-    // build. The store path calls the installed lancedb package instead.
-    let module = py.import_bound("chunkhound.providers.database.lance_store")?;
-    module.call_method1("write_format_probe", (directory,))?;
+    // `directory` is owned, so the GIL can be released for the Lance write.
+    py.allow_threads(|| crate::db::lance_native::write_format_probe(&directory))
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     Ok(())
 }
 

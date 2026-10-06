@@ -1,7 +1,7 @@
-"""A table written through the native store entry opens in installed lancedb.
+"""A table written by the native lance crate opens in installed lancedb.
 
-The native function calls the installed package. A second process opens the
-same directory and reads the row. Both launches must report the same path.
+A second process opens the same directory and reads the row. Both launches
+must report the same path.
 """
 
 import subprocess

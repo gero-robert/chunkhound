@@ -3,6 +3,7 @@ use crate::types::{BatchResult, DbFileEntry, DbWriterBatch};
 
 pub mod duckdb_backend;
 mod lance_backend;
+pub(crate) mod lance_native;
 pub(crate) use duckdb_backend::check_disk_usage_limit;
 pub use duckdb_backend::DuckDbHnswBackend;
 

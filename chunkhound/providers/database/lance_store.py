@@ -1,8 +1,9 @@
-"""Lance writes invoked from the Rust store thread.
+"""Lance helpers for the Rust store thread.
 
-The native ``lance`` crate that matches installed ``pylance`` 0.38.1 does not
-build here (its ``prost-build`` step requires ``protoc``). The store thread
-calls this module, and search/research open the same tables with ``lancedb``.
+Index deletes and inserts run in the Rust ``lance`` crate. This module still
+serves direct Python callers, and the store thread still calls it for the
+vector index, optimize, and file-state reads. Search and research open the
+same tables with ``lancedb``.
 """
 
 from __future__ import annotations
