@@ -47,6 +47,10 @@ rusty-s3   = "0.5"
 # The crate's `protoc` feature calls std::env::set_var from build.rs, which
 # does not compile on rustc 1.87+. Set PROTOC to a protoc binary instead.
 lance      = { version = "=0.38.1", default-features = false }
+# Same 0.38.1 line. DatasetIndexExt and the HNSW/SQ/PQ build params live here.
+# Do not enable the `protoc` feature: its build.rs calls std::env::set_var.
+lance-index = { version = "=0.38.1", default-features = false }
+lance-linalg = { version = "=0.38.1", default-features = false }
 arrow-array = "=56.1.0"
 arrow-schema = "=56.1.0"
 # lance 0.38.1 serializes DateTime, and its chrono dependency leaves serde off.

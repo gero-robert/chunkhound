@@ -247,6 +247,12 @@ def test_short_auto_index_does_not_fail_the_run(tmp_path, monkeypatch):
 
 
 def test_failed_index_build_is_not_a_successful_run(tmp_path, monkeypatch):
+    """A vector index that cannot be trained fails the run.
+
+    Every Rust index run drops the vector index and trains it again. The
+    source file stays unchanged, and the embedding column is removed, so the
+    failure is that rebuild rather than a rewrite of the file.
+    """
     monkeypatch.setenv("CHUNKHOUND_USE_RUST", "1")
     root, provider, coordinator, _embedder = _provider(
         tmp_path, threshold=100, index_type="ivf_hnsw_sq"
@@ -259,15 +265,11 @@ def test_failed_index_build_is_not_a_successful_run(tmp_path, monkeypatch):
         assert first["status"] == "success", first
         assert _ann_indexes(provider, wanted="ivfhnswsq")
 
-        def _fail_create(self, *_args, **_kwargs):
-            raise RuntimeError("disk offline")
+        provider._chunks_table.to_lance().drop_columns(["embedding"])
 
-        monkeypatch.setattr(type(provider._chunks_table), "create_index", _fail_create)
-        (root / "alpha.py").write_text(
-            "def alpha_fn():\n    return 'changed'\n", encoding="utf-8"
-        )
         second = asyncio.run(coordinator.process_directory(root, patterns=["**/*.py"]))
         assert second["status"] == "error", second
+        assert "embedding" in str(second.get("error", "")).lower(), second
     finally:
         provider.disconnect()
 

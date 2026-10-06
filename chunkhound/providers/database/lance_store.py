@@ -1,9 +1,9 @@
-"""Lance helpers for the Rust store thread.
+"""Lance helpers for direct Python callers.
 
-Index deletes and inserts run in the Rust ``lance`` crate. This module still
-serves direct Python callers, and the store thread still calls it for the
-vector index, optimize, and file-state reads. Search and research open the
-same tables with ``lancedb``.
+The Rust store thread runs deletes, inserts, the vector index, optimize, and
+file-state reads in the ``lance`` crate. These functions remain for callers
+that do not go through that thread. Search and research open the same tables
+with ``lancedb``.
 """
 
 from __future__ import annotations

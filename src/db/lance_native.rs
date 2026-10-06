@@ -1,11 +1,9 @@
 //! Lance dataset access for the store thread.
 //!
-//! `write_format_probe` checks that this `lance` crate writes a table the
-//! installed `lancedb` package can open. Index deletes and inserts use the
-//! same crate and match `lance_store.py`: file ids, chunk hashes, schemas,
-//! and the one-time embedding-width migration. The vector index, optimize,
-//! and file-state reads stay in that Python module. Search opens the tables
-//! with `lancedb`.
+//! Deletes, inserts, the vector index, optimize, and file-state reads use
+//! this `lance` crate and do not take the GIL. File ids, chunk hashes,
+//! schemas, and the embedding-width migration match `lance_store.py`. Search
+//! opens the tables with installed `lancedb`.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -19,10 +17,18 @@ use arrow_array::{
     LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use lance::dataset::optimize::CompactionOptions;
 use lance::dataset::{Dataset, NewColumnTransform, WriteMode, WriteParams};
+use lance::index::vector::VectorIndexParams;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
+use lance_index::{DatasetIndexExt, IndexType};
+use lance_linalg::distance::DistanceType;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::types::{BatchResult, ChunkRecord, DbWriterBatch, FileRecord};
+use crate::types::{BatchResult, ChunkRecord, DbFileEntry, DbWriterBatch, FileRecord};
 
 const DELETE_BATCH: usize = 500;
 
@@ -121,6 +127,41 @@ pub(crate) fn write_index_batch(
     batch: &DbWriterBatch,
 ) -> Result<BatchResult, String> {
     block_on(write_batch_async(directory, batch))
+}
+
+/// Drop approximate indexes on `chunks.embedding`. A missing chunks table is
+/// success. Scalar indexes, including the `id` BTree, stay.
+pub(crate) fn drop_vector_indexes(directory: &str) -> Result<(), String> {
+    block_on(drop_vector_indexes_async(directory))
+}
+
+/// Train the cosine vector index when the chunks table does not already have
+/// the requested kind. A missing table, or a table with no embeddings, is
+/// success. "not enough rows" is a warning, matching `lance_store`.
+pub(crate) fn ensure_vector_index(directory: &str, index_type: &str) -> Result<(), String> {
+    block_on(ensure_vector_index_async(directory, index_type))
+}
+
+/// Manifest fragment count of the chunks table. A missing table is 0.
+pub(crate) fn chunk_fragment_count(directory: &str) -> Result<i64, String> {
+    block_on(async {
+        let Some(dataset) = open_table(directory, "chunks").await? else {
+            return Ok(0);
+        };
+        i64::try_from(dataset.count_fragments()).map_err(|err| err.to_string())
+    })
+}
+
+/// Compact `chunks` and `files`, drop versions older than one minute, optimize
+/// existing indexes, then train the vector index. Missing tables are skipped.
+pub(crate) fn optimize_database(directory: &str, index_type: &str) -> Result<(), String> {
+    block_on(optimize_database_async(directory, index_type))
+}
+
+/// File rows the differ compares. Null `modified_time`, `size`, and
+/// `content_hash` stay `None`. A missing files table is an empty list.
+pub(crate) fn read_file_states(directory: &str) -> Result<Vec<DbFileEntry>, String> {
+    block_on(read_file_states_async(directory))
 }
 
 fn block_on<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
@@ -1186,6 +1227,300 @@ fn floats_of(values: &dyn Array) -> Result<Vec<f32>, String> {
         .ok_or_else(|| format!("embedding values are {}, not float32", values.data_type()))
 }
 
+const SCALAR_INDEX_TOKENS: &[&str] = &["btree", "bitmap", "labellist", "fts", "inverted"];
+const FRAGMENT_REUSE_INDEX: &str = "__lance_frag_reuse";
+
+struct ListedIndex {
+    name: String,
+    columns: Vec<String>,
+    token: String,
+}
+
+enum VectorKind {
+    Pq,
+    HnswSq,
+    Rq,
+}
+
+struct IndexRequest {
+    kind: VectorKind,
+    /// `auto` accepts any approximate index already on `embedding`.
+    accept_any: bool,
+    wanted: String,
+}
+
+fn index_token(index_type: &str) -> String {
+    index_type.replace('_', "").to_ascii_lowercase()
+}
+
+fn is_scalar_token(token: &str) -> bool {
+    SCALAR_INDEX_TOKENS.contains(&token)
+}
+
+/// `lance_store._index_type_name` plus `_ensure_vector_index`. The lookup is
+/// case-sensitive. An unknown name trains IVF_PQ and does not treat an
+/// existing approximate index as a match.
+fn index_request(index_type: &str) -> IndexRequest {
+    if index_type.is_empty() || index_type == "auto" {
+        return IndexRequest {
+            kind: VectorKind::Pq,
+            accept_any: true,
+            wanted: String::new(),
+        };
+    }
+    match index_type {
+        "ivf_hnsw_sq" => IndexRequest {
+            kind: VectorKind::HnswSq,
+            accept_any: false,
+            wanted: "ivfhnswsq".to_string(),
+        },
+        "ivf_rq" => IndexRequest {
+            kind: VectorKind::Rq,
+            accept_any: false,
+            wanted: "ivfrq".to_string(),
+        },
+        _ => IndexRequest {
+            kind: VectorKind::Pq,
+            accept_any: false,
+            wanted: String::new(),
+        },
+    }
+}
+
+/// `lancedb` 0.25.3 `suggested_num_partitions`: `sqrt(rows)`, at least 1.
+fn sqrt_partitions(rows: usize) -> usize {
+    let partitions = (rows as f64).sqrt() as u32;
+    partitions.max(1) as usize
+}
+
+/// `lancedb` 0.25.3 `suggested_num_partitions_for_hnsw`.
+fn hnsw_partitions(rows: usize, dim: u32) -> usize {
+    let product = (rows as u64).saturating_mul(u64::from(dim));
+    let partitions = product / (256 * 5_000_000);
+    usize::try_from(partitions.max(1)).unwrap_or(usize::MAX)
+}
+
+/// `lancedb` 0.25.3 `suggested_num_sub_vectors`.
+fn pq_sub_vectors(dim: u32) -> usize {
+    if dim % 16 == 0 {
+        (dim / 16) as usize
+    } else if dim % 8 == 0 {
+        (dim / 8) as usize
+    } else {
+        log::warn!(
+            "The dimension of the vector is not divisible by 8 or 16, \
+             which may cause performance degradation in PQ"
+        );
+        1
+    }
+}
+
+fn embedding_dim(dataset: &Dataset) -> Result<u32, String> {
+    let width = embedding_width(&arrow_schema(dataset))
+        .ok_or_else(|| "chunks embedding column is not a fixed-size float list".to_string())?;
+    u32::try_from(width).map_err(|err| err.to_string())
+}
+
+/// Same arguments installed `lancedb` 0.25.3 sends for `metric="cosine"` with
+/// the other `create_index` arguments left at their defaults. HNSW uses
+/// `m=20` and `ef_construction=300`. IVF_PQ and IVF_RQ use 8 bits.
+fn vector_params(
+    dataset: &Dataset,
+    request: &IndexRequest,
+    rows: usize,
+) -> Result<VectorIndexParams, String> {
+    let dim = embedding_dim(dataset)?;
+    let cosine = DistanceType::Cosine;
+    match request.kind {
+        VectorKind::Pq => Ok(VectorIndexParams::ivf_pq(
+            sqrt_partitions(rows),
+            8,
+            pq_sub_vectors(dim),
+            cosine,
+            50,
+        )),
+        VectorKind::Rq => Ok(VectorIndexParams::ivf_rq(sqrt_partitions(rows), 8, cosine)),
+        VectorKind::HnswSq => {
+            let mut ivf = IvfBuildParams::new(hnsw_partitions(rows, dim));
+            ivf.sample_rate = 256;
+            ivf.max_iters = 50;
+            let hnsw = HnswBuildParams::default()
+                .num_edges(20)
+                .ef_construction(300);
+            let sq = SQBuildParams {
+                sample_rate: 256,
+                ..Default::default()
+            };
+            Ok(VectorIndexParams::with_ivf_hnsw_sq_params(
+                cosine, ivf, hnsw, sq,
+            ))
+        }
+    }
+}
+
+async fn listed_indices(dataset: &Dataset) -> Result<Vec<ListedIndex>, String> {
+    let indices = dataset
+        .load_indices()
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut listed = Vec::new();
+    for index in indices.iter() {
+        if index.name == FRAGMENT_REUSE_INDEX {
+            continue;
+        }
+        let stats = match dataset.index_statistics(&index.name).await {
+            Ok(stats) => stats,
+            Err(_) => continue,
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&stats) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(index_type) = parsed.get("index_type").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let mut columns = Vec::with_capacity(index.fields.len());
+        let mut missing_field = false;
+        for field_id in &index.fields {
+            match dataset.schema().field_by_id(*field_id) {
+                Some(field) => columns.push(field.name.clone()),
+                None => {
+                    missing_field = true;
+                    break;
+                }
+            }
+        }
+        if missing_field {
+            continue;
+        }
+        listed.push(ListedIndex {
+            name: index.name.clone(),
+            columns,
+            token: index_token(index_type),
+        });
+    }
+    Ok(listed)
+}
+
+fn covers_embedding(index: &ListedIndex) -> bool {
+    index.columns.iter().any(|column| column == "embedding") && !is_scalar_token(&index.token)
+}
+
+fn index_satisfies(request: &IndexRequest, index: &ListedIndex) -> bool {
+    covers_embedding(index) && (request.accept_any || index.token == request.wanted)
+}
+
+async fn drop_vector_indexes_async(directory: &str) -> Result<(), String> {
+    let Some(mut dataset) = open_table(directory, "chunks").await? else {
+        return Ok(());
+    };
+    let listed = listed_indices(&dataset).await?;
+    for index in listed {
+        if covers_embedding(&index) {
+            dataset
+                .drop_index(&index.name)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_vector_index_async(directory: &str, index_type: &str) -> Result<(), String> {
+    let Some(mut dataset) = open_table(directory, "chunks").await? else {
+        return Ok(());
+    };
+    let request = index_request(index_type);
+    if listed_indices(&dataset)
+        .await?
+        .iter()
+        .any(|index| index_satisfies(&request, index))
+    {
+        return Ok(());
+    }
+    let embedded = dataset
+        .count_rows(Some("embedding IS NOT NULL".to_string()))
+        .await
+        .map_err(|err| err.to_string())?;
+    if embedded < 1 {
+        return Ok(());
+    }
+    let rows = dataset
+        .count_rows(None)
+        .await
+        .map_err(|err| err.to_string())?;
+    let params = vector_params(&dataset, &request, rows)?;
+    if let Err(err) = dataset
+        .create_index(&["embedding"], IndexType::Vector, None, &params, true)
+        .await
+    {
+        let text = err.to_string();
+        if text.to_ascii_lowercase().contains("not enough rows") {
+            log::warn!("Lance vector index skipped: {text}");
+            return Ok(());
+        }
+        return Err(text);
+    }
+    Ok(())
+}
+
+fn versions_older_than() -> chrono::Duration {
+    chrono::Duration::try_milliseconds(60_000).expect("one minute fits in a chrono duration")
+}
+
+async fn optimize_table(dataset: &mut Dataset) -> Result<(), String> {
+    let remap: Option<Arc<dyn lance::dataset::optimize::IndexRemapperOptions>> = None;
+    lance::dataset::optimize::compact_files(dataset, CompactionOptions::default(), remap)
+        .await
+        .map_err(|err| err.to_string())?;
+    dataset
+        .cleanup_old_versions(versions_older_than(), Some(true), None)
+        .await
+        .map_err(|err| err.to_string())?;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn optimize_database_async(directory: &str, index_type: &str) -> Result<(), String> {
+    for name in ["chunks", "files"] {
+        if let Some(mut dataset) = open_table(directory, name).await? {
+            optimize_table(&mut dataset).await?;
+        }
+    }
+    ensure_vector_index_async(directory, index_type).await
+}
+
+async fn read_file_states_async(directory: &str) -> Result<Vec<DbFileEntry>, String> {
+    let Some(dataset) = open_table(directory, "files").await? else {
+        return Ok(Vec::new());
+    };
+    let rows = dataset
+        .count_rows(None)
+        .await
+        .map_err(|err| err.to_string())?;
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    let mut scan = dataset.scan();
+    scan.project(&["id", "path", "modified_time", "size", "content_hash"])
+        .map_err(|err| err.to_string())?;
+    let batch = scan.try_into_batch().await.map_err(|err| err.to_string())?;
+    let mut files = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        files.push(DbFileEntry {
+            id: required_i64(&batch, "id", row)?,
+            path: utf8_or_empty(&batch, "path", row)?,
+            mtime: optional_f64(&batch, "modified_time", row)?,
+            size_bytes: optional_i64(&batch, "size", row)?,
+            content_hash: optional_utf8(&batch, "content_hash", row)?,
+        });
+    }
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1454,6 +1789,20 @@ mod tests {
             files_by_path["added.py"].content_hash.as_deref(),
             Some("abc")
         );
+
+        let states = read_file_states(directory).unwrap();
+        let states_by_path = states
+            .iter()
+            .map(|row| (row.path.as_str(), row))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(states_by_path["kept.py"].mtime.is_none());
+        assert!(states_by_path["kept.py"].content_hash.is_none());
+        assert_eq!(states_by_path["added.py"].mtime, Some(1.5));
+        assert_eq!(
+            states_by_path["added.py"].content_hash.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(states_by_path["added.py"].size_bytes, Some(4));
     }
 
     #[test]
@@ -1594,6 +1943,109 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.file_ids, vec![4]);
+    }
+
+    #[test]
+    fn partition_counts_match_installed_lancedb() {
+        assert_eq!(hnsw_partitions(47_184, 1536), 1);
+        assert_eq!(hnsw_partitions(2_000_000, 1536), 2);
+        assert_eq!(sqrt_partitions(47_184), 217);
+        assert_eq!(pq_sub_vectors(1536), 96);
+        assert_eq!(pq_sub_vectors(8), 1);
+    }
+
+    #[test]
+    fn missing_tables_skip_index_and_file_state_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().to_str().unwrap();
+        assert_eq!(chunk_fragment_count(directory).unwrap(), 0);
+        assert!(read_file_states(directory).unwrap().is_empty());
+        drop_vector_indexes(directory).unwrap();
+        ensure_vector_index(directory, "ivf_hnsw_sq").unwrap();
+        optimize_database(directory, "ivf_hnsw_sq").unwrap();
+    }
+
+    #[test]
+    fn vector_index_uses_cosine_hnsw_sq_and_keeps_the_id_btree() {
+        use lance_index::DatasetIndexExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().to_str().unwrap();
+        let chunks = (0..64)
+            .map(|i| {
+                chunk(
+                    &format!("f{i}"),
+                    &format!("code {i}"),
+                    1,
+                    1,
+                    Some(vec![i as f32; 16]),
+                )
+            })
+            .collect();
+        write_index_batch(
+            directory,
+            &DbWriterBatch {
+                files: vec![file("src/a.py", None, chunks)],
+                delete_paths: vec![],
+            },
+        )
+        .unwrap();
+        ensure_vector_index(directory, "ivf_hnsw_sq").unwrap();
+        assert!(chunk_fragment_count(directory).unwrap() > 0);
+
+        let stats = block_on(async {
+            let mut dataset = open_table(directory, "chunks").await?.unwrap();
+            let params = lance_index::scalar::ScalarIndexParams::default();
+            dataset
+                .create_index(
+                    &["id"],
+                    lance_index::IndexType::BTree,
+                    Some("id_idx".into()),
+                    &params,
+                    true,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            let stats = dataset
+                .index_statistics("embedding_idx")
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok::<String, String>(stats)
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(parsed["index_type"].as_str(), Some("IVF_HNSW_SQ"));
+        assert_eq!(parsed["indices"][0]["num_partitions"].as_u64(), Some(1));
+        assert!(stats.to_ascii_lowercase().contains("cosine"), "{stats}");
+
+        drop_vector_indexes(directory).unwrap();
+        let names = block_on(async {
+            let dataset = open_table(directory, "chunks").await?.unwrap();
+            let listed = listed_indices(&dataset).await?;
+            Ok::<Vec<String>, String>(listed.into_iter().map(|index| index.name).collect())
+        })
+        .unwrap();
+        assert_eq!(names, vec!["id_idx".to_string()]);
+
+        ensure_vector_index(directory, "ivf_hnsw_sq").unwrap();
+        let names = block_on(async {
+            let dataset = open_table(directory, "chunks").await?.unwrap();
+            let mut listed = listed_indices(&dataset).await?;
+            listed.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok::<Vec<String>, String>(listed.into_iter().map(|index| index.name).collect())
+        })
+        .unwrap();
+        assert_eq!(
+            names,
+            vec!["embedding_idx".to_string(), "id_idx".to_string()]
+        );
+
+        let states = read_file_states(directory).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].path, "src/a.py");
+        assert_eq!(states[0].mtime, Some(1.5));
+        assert_eq!(states[0].size_bytes, Some(4));
+        assert_eq!(states[0].content_hash.as_deref(), Some("abc"));
     }
 
     fn dataset_fragment_count(directory: &str, name: &str) -> usize {

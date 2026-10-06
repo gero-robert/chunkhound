@@ -1,12 +1,8 @@
 //! LanceDB store backend.
 //!
-//! Index deletes and inserts run in the `lance` crate (`lance_native`),
-//! without taking the GIL. The vector index, optimize, and file-state reads
-//! still go through `chunkhound.providers.database.lance_store`. Search and
-//! research open the same tables with installed `lancedb`.
-
-use pyo3::prelude::*;
-use serde::Deserialize;
+//! Index deletes, inserts, the vector index, optimize, and file-state reads
+//! run in the `lance` crate (`lance_native`) without taking the GIL. Search
+//! and research open the same tables with installed `lancedb`.
 
 use crate::db::{DbBackend, DbConfig};
 use crate::error::DbError;
@@ -31,31 +27,6 @@ impl LanceCallbackBackend {
             restore_index: false,
         }
     }
-
-    fn call(&self, method: &str, payload: Option<&str>) -> Result<String, DbError> {
-        Python::with_gil(|py| {
-            let module = py
-                .import_bound("chunkhound.providers.database.lance_store")
-                .map_err(|err| DbError::Other(err.to_string()))?;
-            let result = match payload {
-                Some(body) => module.call_method1(method, (self.db_path.as_str(), body)),
-                None => module.call_method1(method, (self.db_path.as_str(),)),
-            }
-            .map_err(|err| DbError::Other(err.to_string()))?;
-            result
-                .extract()
-                .map_err(|err| DbError::Other(err.to_string()))
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct FileStateRow {
-    id: i64,
-    path: String,
-    mtime: Option<f64>,
-    size_bytes: Option<i64>,
-    content_hash: Option<String>,
 }
 
 /// True when the batch removes paths or replaces an existing file id.
@@ -94,16 +65,14 @@ impl DbBackend for LanceCallbackBackend {
         // Before the drop, so a mid-drop failure still rebuilds from close().
         // Adds must not maintain the ANN index.
         self.restore_index = true;
-        self.call("drop_vector_indexes", None)?;
-        Ok(())
+        crate::db::lance_native::drop_vector_indexes(&self.db_path).map_err(DbError::Other)
     }
 
     fn ensure_all_hnsw_indexes(&mut self) -> Result<(), DbError> {
         // Clear first so a failed build is not trained again from close().
         self.restore_index = false;
-        let payload = serde_json::json!({ "index_type": self.index_type }).to_string();
-        self.call("ensure_vector_index", Some(&payload))?;
-        Ok(())
+        crate::db::lance_native::ensure_vector_index(&self.db_path, &self.index_type)
+            .map_err(DbError::Other)
     }
 
     fn needs_compaction(&self) -> Result<bool, DbError> {
@@ -112,18 +81,14 @@ impl DbBackend for LanceCallbackBackend {
         if self.fragment_threshold == 0 {
             return Ok(true);
         }
-        let raw = self.call("chunk_fragment_count", None)?;
-        let count: i64 = raw.trim().parse().map_err(|err| {
-            DbError::Other(format!(
-                "Lance fragment count '{raw}' is not an integer: {err}"
-            ))
-        })?;
+        let count =
+            crate::db::lance_native::chunk_fragment_count(&self.db_path).map_err(DbError::Other)?;
         Ok(count >= i64::from(self.fragment_threshold))
     }
 
     fn run_compaction(&mut self) -> Result<(), DbError> {
-        let payload = serde_json::json!({ "index_type": self.index_type }).to_string();
-        self.call("optimize_database", Some(&payload))?;
+        crate::db::lance_native::optimize_database(&self.db_path, &self.index_type)
+            .map_err(DbError::Other)?;
         // optimize builds the index. Failure leaves restore_index set so
         // close() builds it; success must not build it again.
         self.restore_index = false;
@@ -131,18 +96,7 @@ impl DbBackend for LanceCallbackBackend {
     }
 
     fn read_file_states(&self) -> Result<Vec<DbFileEntry>, DbError> {
-        let raw = self.call("read_file_states", None)?;
-        let rows: Vec<FileStateRow> = serde_json::from_str(&raw)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| DbFileEntry {
-                id: row.id,
-                path: row.path,
-                mtime: row.mtime,
-                size_bytes: row.size_bytes,
-                content_hash: row.content_hash,
-            })
-            .collect())
+        crate::db::lance_native::read_file_states(&self.db_path).map_err(DbError::Other)
     }
 }
 

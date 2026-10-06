@@ -1028,6 +1028,8 @@ dependencies = [
  "httpmock",
  "ignore",
  "lance",
+ "lance-index",
+ "lance-linalg",
  "log",
  "pyo3",
  "pyo3-log",
